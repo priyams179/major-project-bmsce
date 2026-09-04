@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.uv/
+*.egg-info/
+pip-log.txt
+
+# Model weights (regenerable via train_cnn.py, too large for Git)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Data - regenerable via sen1floods11.py --download
+data/
+dataset/
+*.npy
+*.npz
+splits.json
+
+# Sentinel-1 raw products
+*.zip
+*.SAFE/
+*.tif
+*.tiff
+*.vrt
+*.aux.xml
+*.ovr
+
+# Pipeline outputs - regenerable
+models/
+output/
+predictions/
+predictions_custom/
+
+# OS / IDE / logs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.log
+.crush/
