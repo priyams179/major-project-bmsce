@@ -167,7 +167,7 @@ def calibrate_safe_band(safe_dir: str, pol: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 2. Sliding Window Inference with 2D Hann Blending
+# 2. Sliding Window Inference with 2D Hann Blending & TTA
 # ---------------------------------------------------------------------------
 def get_hann_window_2d(patch_size: int = 512) -> np.ndarray:
     """Create a 2D Hann (cosine) tapered window for smooth boundary blending."""
@@ -177,12 +177,41 @@ def get_hann_window_2d(patch_size: int = 512) -> np.ndarray:
     return np.maximum(w2d, 1e-4).astype(np.float32)
 
 
-def predict_full_raster(model, vv_db: np.ndarray, vh_db: np.ndarray, device, patch_size: int = 512, stride: int = 256) -> np.ndarray:
-    """Run sliding-window U-Net inference on large SAR raster with 2D Hann blending."""
+def predict_patch_tta(model, patch_tensor: torch.Tensor, use_tta: bool = False) -> torch.Tensor:
+    """Run model inference with optional 4-fold Test-Time Augmentation."""
+    logits = model(patch_tensor)
+    prob = torch.sigmoid(logits)
+    if not use_tta:
+        return prob
+
+    # 1. Horizontal Flip
+    p_h = torch.flip(patch_tensor, dims=[-1])
+    prob_h = torch.flip(torch.sigmoid(model(p_h)), dims=[-1])
+
+    # 2. Vertical Flip
+    p_v = torch.flip(patch_tensor, dims=[-2])
+    prob_v = torch.flip(torch.sigmoid(model(p_v)), dims=[-2])
+
+    # 3. 90-degree Rotation
+    p_r = torch.rot90(patch_tensor, 1, dims=[-2, -1])
+    prob_r = torch.rot90(torch.sigmoid(model(p_r)), -1, dims=[-2, -1])
+
+    return (prob + prob_h + prob_v + prob_r) / 4.0
+
+
+def predict_full_raster(model, vv_db: np.ndarray, vh_db: np.ndarray, device,
+                        in_channels: int = 2, patch_size: int = 512,
+                        stride: int = 256, use_tta: bool = False) -> np.ndarray:
+    """Run sliding-window inference on large SAR raster with 2D Hann blending and TTA."""
     H, W = vv_db.shape
     vv_norm = normalize_s1_band(vv_db)
     vh_norm = normalize_s1_band(vh_db)
-    X = np.stack([vv_norm, vh_norm], axis=0)
+
+    if in_channels == 3:
+        diff_norm = np.clip((vh_norm - vv_norm + 1.0) / 2.0, 0.0, 1.0).astype(np.float32)
+        X = np.stack([vv_norm, vh_norm, diff_norm], axis=0)
+    else:
+        X = np.stack([vv_norm, vh_norm], axis=0)
 
     prob_accum = np.zeros((H, W), dtype=np.float32)
     weight_accum = np.zeros((H, W), dtype=np.float32)
@@ -205,8 +234,7 @@ def predict_full_raster(model, vv_db: np.ndarray, vh_db: np.ndarray, device, pat
             for px in x_steps:
                 patch = X[:, py:py+patch_size, px:px+patch_size]
                 t_in = torch.from_numpy(patch).unsqueeze(0).to(device)
-                logits = model(t_in)
-                pred_patch = torch.sigmoid(logits).squeeze().cpu().numpy()
+                pred_patch = predict_patch_tta(model, t_in, use_tta=use_tta).squeeze().cpu().numpy()
 
                 prob_accum[py:py+patch_size, px:px+patch_size] += pred_patch * window
                 weight_accum[py:py+patch_size, px:px+patch_size] += window
@@ -214,7 +242,7 @@ def predict_full_raster(model, vv_db: np.ndarray, vh_db: np.ndarray, device, pat
                 if done % 10 == 0 or done == total_patches:
                     print(f"  Inference Progress: {done}/{total_patches} patches ({(done/total_patches)*100:.1f}%)", end="\r")
 
-    print(f"\n  Inference completed across {done} patches.")
+    print(f"\n  Inference completed across {done} patches (TTA={use_tta}).")
     weight_accum = np.maximum(weight_accum, 1e-6)
     return (prob_accum / weight_accum).astype(np.float32)
 
@@ -227,6 +255,7 @@ def main():
     parser.add_argument("--post-flood", required=True, help="Path to post-flood .SAFE folder or .zip")
     parser.add_argument("--pre-flood", default=None, help="Path to pre-flood .SAFE folder or .zip (for permanent water baseline)")
     parser.add_argument("--model", default="models/best_model.pth", help="Path to trained U-Net checkpoint")
+    parser.add_argument("--tta", action="store_true", help="Enable 4-fold Test-Time Augmentation")
     parser.add_argument("--dem", default=None, help="Path to external DEM GeoTIFF (optional)")
     parser.add_argument("--max-slope", type=float, default=5.0, help="Slope threshold in degrees (default: 5.0)")
     parser.add_argument("--threshold", type=float, default=0.5, help="Water probability threshold (default: 0.5)")
@@ -240,12 +269,14 @@ def main():
     print("=" * 70)
     print(f"Device: {device}")
 
-    # --- 1. Load Model ---
+    # --- 1. Load Model with Auto-Architecture Detection ---
+    from cnn_model import get_model
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     in_channels = checkpoint.get("in_channels", 2)
-    model = UNet(in_channels=in_channels, base_features=32).to(device)
+    arch = checkpoint.get("arch", "unet")
+    model = get_model(arch=arch, in_channels=in_channels, pretrained=False).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded model checkpoint '{args.model}' (Val IoU: {checkpoint.get('val_iou', 0.0)*100:.2f}%)")
+    print(f"Loaded {arch.upper()} checkpoint '{args.model}' (in_channels={in_channels}, Val IoU: {checkpoint.get('val_iou', 0.0)*100:.2f}%)")
 
     # --- 2. Process Post-Flood Scene ---
     post_safe = ensure_extracted_safe(args.post_flood)
@@ -258,9 +289,12 @@ def main():
     print(f"  Calibrated in {time.time() - t0:.1f}s. Image size: {W} x {H} pixels")
 
     # --- 3. Neural Network Inference ---
-    print("\n[2/4] Running U-Net Sliding-Window Inference...")
+    print("\n[2/4] Running Neural Network Sliding-Window Inference...")
     t0 = time.time()
-    prob_map = predict_full_raster(model, post_vv, post_vh, device, patch_size=512, stride=256)
+    prob_map = predict_full_raster(
+        model, post_vv, post_vh, device, in_channels=in_channels,
+        patch_size=512, stride=256, use_tta=args.tta
+    )
     print(f"  Inference completed in {time.time() - t0:.1f}s.")
 
     # --- 4. Permanent Water Separation (if pre-flood provided) ---
@@ -270,7 +304,10 @@ def main():
         print(f"\n[3/4] Calibrating & Evaluating Pre-Flood Baseline: {os.path.basename(pre_safe)}")
         pre_vv = calibrate_safe_band(pre_safe, "vv")
         pre_vh = calibrate_safe_band(pre_safe, "vh")
-        pre_prob = predict_full_raster(model, pre_vv, pre_vh, device, patch_size=512, stride=256)
+        pre_prob = predict_full_raster(
+            model, pre_vv, pre_vh, device, in_channels=in_channels,
+            patch_size=512, stride=256, use_tta=args.tta
+        )
         perm_water_mask = pre_prob > args.threshold
         print(f"  Permanent baseline water: {int(perm_water_mask.sum()):,} pixels")
 

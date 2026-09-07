@@ -1,4 +1,6 @@
-# Python
+# ==============================================================================
+# Python & Virtual Environments
+# ==============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -7,22 +9,32 @@ venv/
 .uv/
 *.egg-info/
 pip-log.txt
+*.tmp
 
-# Model weights (regenerable via train_cnn.py, too large for Git)
+# ==============================================================================
+# Model Checkpoints & Weights (Large binaries, regenerable via train_cnn.py)
+# ==============================================================================
 *.pth
 *.pt
 *.ckpt
 *.safetensors
+*.onnx
+models/
+models_*/
 
-# Data - regenerable via sen1floods11.py --download
+# ==============================================================================
+# Large Datasets & Remote Sensing Data
+# ==============================================================================
 data/
 dataset/
 *.npy
 *.npz
 splits.json
 
-# Sentinel-1 raw products
+# Raw Sentinel-1 SAFE archives & GeoTIFFs
 *.zip
+*.tar.gz
+*.tgz
 *.SAFE/
 *.tif
 *.tiff
@@ -30,13 +42,17 @@ splits.json
 *.aux.xml
 *.ovr
 
-# Pipeline outputs - regenerable
-models/
+# ==============================================================================
+# Pipeline Predictions & Large Output Raster Products
+# ==============================================================================
 output/
+output_*/
 predictions/
-predictions_custom/
+predictions_*/
 
-# OS / IDE / logs
+# ==============================================================================
+# OS / IDE / Logs / Scratch
+# ==============================================================================
 .DS_Store
 Thumbs.db
 .vscode/
