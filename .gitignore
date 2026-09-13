@@ -1,62 +1,62 @@
 # ==============================================================================
 # Python & Virtual Environments
 # ==============================================================================
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-.uv/
-*.egg-info/
-pip-log.txt
-*.tmp
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.venv/
+**/venv/
+**/.uv/
+**/*.egg-info/
+**/pip-log.txt
+**/*.tmp
 
 # ==============================================================================
 # Model Checkpoints & Weights (Large binaries, regenerable via train_cnn.py)
 # ==============================================================================
-*.pth
-*.pt
-*.ckpt
-*.safetensors
-*.onnx
-models/
-models_*/
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.safetensors
+**/*.onnx
+**/models/
+**/models_*/
 
 # ==============================================================================
 # Large Datasets & Remote Sensing Data
 # ==============================================================================
-data/
-dataset/
-*.npy
-*.npz
-splits.json
+**/data/
+**/dataset/
+**/*.npy
+**/*.npz
+**/splits.json
 
 # Raw Sentinel-1 SAFE archives & GeoTIFFs
-*.zip
-*.tar.gz
-*.tgz
-*.SAFE/
-*.tif
-*.tiff
-*.vrt
-*.aux.xml
-*.ovr
+**/*.zip
+**/*.tar.gz
+**/*.tgz
+**/*.SAFE/
+**/*.tif
+**/*.tiff
+**/*.vrt
+**/*.aux.xml
+**/*.ovr
 
 # ==============================================================================
 # Pipeline Predictions & Large Output Raster Products
 # ==============================================================================
-output/
-output_*/
-predictions/
-predictions_*/
+**/output/
+**/output_*/
+**/predictions/
+**/predictions_*/
 
 # ==============================================================================
 # OS / IDE / Logs / Scratch
 # ==============================================================================
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-*.swp
-*.log
-.crush/
+**/.DS_Store
+**/Thumbs.db
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.log
+**/.crush/
