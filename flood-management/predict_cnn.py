@@ -27,7 +27,7 @@ import numpy as np
 import rasterio
 import torch
 
-from cnn_model import UNet
+from cnn_model import get_model, UNet
 from postprocess import (
     compute_terrain_slope,
     fetch_dem_for_raster,
@@ -38,7 +38,7 @@ from sen1floods11 import load_chip_ids_from_csv, normalize_s1_band
 
 
 def predict_sar_array(model, vv: np.ndarray, vh: np.ndarray, device, in_channels: int = 2) -> np.ndarray:
-    """Run U-Net on VV and VH 2D arrays, returning 2D probability map."""
+    """Run model on VV and VH 2D arrays, returning 2D probability map."""
     vv_norm = normalize_s1_band(vv)
     vh_norm = normalize_s1_band(vh)
 
@@ -102,10 +102,11 @@ def main():
 
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     in_channels = checkpoint.get("in_channels", 2)
-    model = UNet(in_channels=in_channels, base_features=32).to(device)
+    arch = checkpoint.get("arch", "unet")
+    model = get_model(arch=arch, in_channels=in_channels, pretrained=False).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     val_iou = checkpoint.get("val_iou", 0.0)
-    print(f"Loaded model from '{args.model}' (in_channels={in_channels}, Best Val IoU={val_iou*100:.2f}%)")
+    print(f"Loaded {arch.upper()} model from '{args.model}' (in_channels={in_channels}, Best Val IoU={val_iou*100:.2f}%)")
 
     # --- 2. Determine Input SAR Image ---
     s1_dir = os.path.join(args.data_dir, "v1.1", "data", "flood_events", "HandLabeled", "S1Hand")

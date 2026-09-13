@@ -1,46 +1,62 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-.uv/
-*.egg-info/
-pip-log.txt
+# ==============================================================================
+# Python & Virtual Environments
+# ==============================================================================
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.venv/
+**/venv/
+**/.uv/
+**/*.egg-info/
+**/pip-log.txt
+**/*.tmp
 
-# Model weights (regenerable via train_cnn.py, too large for Git)
-*.pth
-*.pt
-*.ckpt
-*.safetensors
+# ==============================================================================
+# Model Checkpoints & Weights (Large binaries, regenerable via train_cnn.py)
+# ==============================================================================
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.safetensors
+**/*.onnx
+**/models/
+**/models_*/
 
-# Data - regenerable via sen1floods11.py --download
-data/
-dataset/
-*.npy
-*.npz
-splits.json
+# ==============================================================================
+# Large Datasets & Remote Sensing Data
+# ==============================================================================
+**/data/
+**/dataset/
+**/*.npy
+**/*.npz
+**/splits.json
 
-# Sentinel-1 raw products
-*.zip
-*.SAFE/
-*.tif
-*.tiff
-*.vrt
-*.aux.xml
-*.ovr
+# Raw Sentinel-1 SAFE archives & GeoTIFFs
+**/*.zip
+**/*.tar.gz
+**/*.tgz
+**/*.SAFE/
+**/*.tif
+**/*.tiff
+**/*.vrt
+**/*.aux.xml
+**/*.ovr
 
-# Pipeline outputs - regenerable
-models/
-output/
-predictions/
-predictions_custom/
+# ==============================================================================
+# Pipeline Predictions & Large Output Raster Products
+# ==============================================================================
+**/output/
+**/output_*/
+**/predictions/
+**/predictions_*/
 
-# OS / IDE / logs
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-*.swp
-*.log
-.crush/
+# ==============================================================================
+# OS / IDE / Logs / Scratch
+# ==============================================================================
+**/.DS_Store
+**/Thumbs.db
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.log
+**/.crush/

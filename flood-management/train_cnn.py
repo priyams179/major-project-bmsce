@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Train U-Net on the Sen1Floods11 Sentinel-1 SAR Flood Benchmark Dataset.
+Train Advanced Deep Learning Models on Sen1Floods11 & Multi-Dataset SAR Imagery.
 
 Features:
-  - Trains on official Sen1Floods11 hand-labeled splits (Train: 252, Val: 89, Test: 90 chips)
-  - Masked BCE + Dice / Focal-Tversky loss handling cloud/nodata (-1) pixels
-  - Real-time data augmentations (flips, rotations)
-  - Exact dataset-level Confusion Matrix tracking (IoU, F1, Precision, Recall)
-  - Automatic download support
+  - Supports Pretrained ResNet-34 U-Net with ASPP multi-scale bottleneck & standard U-Net
+  - Flexible 2-channel [VV, VH] or 3-channel [VV, VH, (VH - VV) difference ratio] inputs
+  - Scalable to multi-dataset training (including 814 global permanent water chips)
+  - Masked Focal-Tversky loss (for high recall) and Masked BCE + Dice loss
+  - Real-time geometric data augmentations (flips, 90-degree rotations)
+  - Exact dataset-level Confusion Matrix tracking (IoU, F1, Precision, Recall, Accuracy)
 
 Usage:
-    uv run python train_cnn.py --download --epochs 30 --batch-size 16
+    uv run python train_cnn.py --arch resnet34 --in-channels 3 --loss focal_tversky --epochs 25
 """
 
 import argparse
@@ -25,7 +26,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from cnn_model import (
-    UNet,
+    get_model,
     MaskedBCEDiceLoss,
     MaskedFocalTverskyLoss,
     ConfusionMatrixTracker,
@@ -66,25 +67,26 @@ def evaluate(model, loader, criterion, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train U-Net on Sen1Floods11 Flood Dataset")
+    parser = argparse.ArgumentParser(description="Train Advanced Models on SAR Flood Datasets")
     parser.add_argument("--data-dir", default="data/sen1floods11", help="Path to Sen1Floods11 directory")
     parser.add_argument("--download", action="store_true", help="Download Sen1Floods11 data if not present")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs (default: 30)")
+    parser.add_argument("--arch", choices=["resnet34", "unet"], default="resnet34", help="Model architecture")
+    parser.add_argument("--in-channels", type=int, default=3, choices=[2, 3], help="Input channels (2: [VV, VH], 3: [VV, VH, diff])")
+    parser.add_argument("--include-perm", action="store_true", help="Include permanent water dataset chips in training")
+    parser.add_argument("--loss", choices=["focal_tversky", "bce_dice"], default="focal_tversky", help="Loss function")
+    parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs (default: 25)")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size (default: 16)")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate (default: 3e-4)")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay (default: 1e-4)")
-    parser.add_argument("--in-channels", type=int, default=2, choices=[2, 3], help="Input channels (2: [VV, VH], 3: [VV, VH, diff])")
-    parser.add_argument("--loss", choices=["bce_dice", "focal_tversky"], default="bce_dice", help="Loss function")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers (default: 4)")
     parser.add_argument("--output-dir", default="models", help="Directory to save checkpoints and plots")
-    parser.add_argument("--chips", type=int, default=0, help="Limit chips for testing (0 = full dataset)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("=" * 65)
-    print("Sen1Floods11 U-Net Training Pipeline")
-    print("=" * 65)
+    print("=" * 70)
+    print("Advanced Sentinel-1 Deep Learning Flood Training Pipeline")
+    print("=" * 70)
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -93,18 +95,27 @@ def main():
     # --- 1. Dataset Preparation / Download ---
     if args.download or not os.path.exists(os.path.join(args.data_dir, "splits")):
         print(f"\nVerifying / Downloading Sen1Floods11 dataset into '{args.data_dir}'...")
-        download_sen1floods11(args.data_dir, max_chips=args.chips, workers=8)
+        download_sen1floods11(args.data_dir, include_perm=args.include_perm, workers=16)
 
     print("\nLoading dataset splits:")
-    train_ds = Sen1Floods11Dataset(data_dir=args.data_dir, split="train", in_channels=args.in_channels, augment=True)
-    val_ds = Sen1Floods11Dataset(data_dir=args.data_dir, split="val", in_channels=args.in_channels, augment=False)
-    test_ds = Sen1Floods11Dataset(data_dir=args.data_dir, split="test", in_channels=args.in_channels, augment=False)
+    train_ds = Sen1Floods11Dataset(
+        data_dir=args.data_dir, split="train", in_channels=args.in_channels,
+        include_perm=args.include_perm, augment=True
+    )
+    val_ds = Sen1Floods11Dataset(
+        data_dir=args.data_dir, split="val", in_channels=args.in_channels,
+        include_perm=False, augment=False
+    )
+    test_ds = Sen1Floods11Dataset(
+        data_dir=args.data_dir, split="test", in_channels=args.in_channels,
+        include_perm=False, augment=False
+    )
 
     if len(train_ds) == 0:
         print(f"[Error] No training chips found in {args.data_dir}. Please run with `--download` flag.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"  Train: {len(train_ds)} chips")
+    print(f"  Train: {len(train_ds)} chips (Include Permanent Water: {args.include_perm})")
     print(f"  Val:   {len(val_ds)} chips")
     print(f"  Test:  {len(test_ds)} chips")
 
@@ -122,14 +133,17 @@ def main():
     )
 
     # --- 2. Build Model & Loss ---
-    model = UNet(in_channels=args.in_channels, base_features=32).to(device)
+    model = get_model(arch=args.arch, in_channels=args.in_channels, pretrained=True).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel: U-Net (in_channels={args.in_channels}, base_features=32, params={n_params:,})")
+    print(f"\nModel: {args.arch.upper()} (in_channels={args.in_channels}, params={n_params:,})")
 
-    if args.loss == "bce_dice":
-        criterion = MaskedBCEDiceLoss(bce_weight=0.5, dice_weight=0.5)
+    if args.loss == "focal_tversky":
+        # alpha=0.3, beta=0.7 puts high penalty on false negatives -> boosts recall
+        criterion = MaskedFocalTverskyLoss(alpha=0.3, beta=0.7, gamma=1.33)
+        print("Loss: Masked Focal Tversky Loss (alpha=0.3, beta=0.7, gamma=1.33 - Optimized for High Recall)")
     else:
-        criterion = MaskedFocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+        criterion = MaskedBCEDiceLoss(bce_weight=0.5, dice_weight=0.5)
+        print("Loss: Masked BCE + Dice Loss (50/50)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -195,12 +209,15 @@ def main():
             best_val_iou = val_iou
             best_path = os.path.join(args.output_dir, "best_model.pth")
             torch.save({
+                "arch": args.arch,
+                "in_channels": args.in_channels,
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_iou": val_iou,
                 "val_f1": val_f1,
-                "in_channels": args.in_channels,
+                "val_precision": val_prec,
+                "val_recall": val_rec,
             }, best_path)
 
     total_time = time.time() - t_start
@@ -208,10 +225,11 @@ def main():
     print(f"Training completed in {total_time / 60:.1f} minutes. Best Val IoU: {best_val_iou * 100:.2f}%")
 
     # --- 4. Final Evaluation on Test Split ---
-    print("\n" + "=" * 65)
-    print("Evaluating Best Model on Official Sen1Floods11 Test Set:")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print("Evaluating Best Model on Official Sen1Floods11 Global Test Set:")
+    print("=" * 70)
     best_checkpoint = torch.load(os.path.join(args.output_dir, "best_model.pth"), map_location=device, weights_only=False)
+    model = get_model(arch=best_checkpoint.get("arch", "unet"), in_channels=best_checkpoint.get("in_channels", 2)).to(device)
     model.load_state_dict(best_checkpoint["model_state_dict"])
 
     test_loss, test_metrics = evaluate(model, test_loader, criterion, device)

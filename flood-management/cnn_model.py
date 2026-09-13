@@ -115,6 +115,193 @@ class UNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Atrous Spatial Pyramid Pooling (ASPP)
+# ---------------------------------------------------------------------------
+class ASPPConv(nn.Sequential):
+    def __init__(self, in_ch, out_ch, dilation):
+        super().__init__(
+            nn.Conv2d(in_ch, out_ch, 3, padding=dilation, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+
+class ASPPPooling(nn.Sequential):
+    def __init__(self, in_ch, out_ch):
+        super().__init__(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        for mod in self:
+            x = mod(x)
+        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+
+
+class ASPP(nn.Module):
+    """Multi-dilation rate feature pooling for multi-scale water context."""
+
+    def __init__(self, in_ch, out_ch, atrous_rates=(6, 12, 18)):
+        super().__init__()
+        modules = [
+            nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+        ]
+        for rate in atrous_rates:
+            modules.append(ASPPConv(in_ch, out_ch, rate))
+        modules.append(ASPPPooling(in_ch, out_ch))
+        self.convs = nn.ModuleList(modules)
+        self.project = nn.Sequential(
+            nn.Conv2d(len(self.convs) * out_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
+        )
+
+    def forward(self, x):
+        res = [conv(x) for conv in self.convs]
+        res = torch.cat(res, dim=1)
+        return self.project(res)
+
+
+# ---------------------------------------------------------------------------
+# Pretrained ResNet-34 U-Net with ASPP Bottleneck
+# ---------------------------------------------------------------------------
+class DecoderBlock(nn.Module):
+    """Upsample via Bilinear + Conv, concatenate skip, and apply DoubleConv."""
+
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        up_ch = in_ch // 2 if in_ch > 32 else in_ch
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_ch, up_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(up_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv = DoubleConv(up_ch + skip_ch, out_ch)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        if diffX != 0 or diffY != 0:
+            x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class ResNet34UNet(nn.Module):
+    """
+    U-Net with Pretrained ResNet-34 Encoder and ASPP Multi-Scale Bottleneck.
+    Supports arbitrary input channels (e.g. 2, 3, 4) with pretrained weight transfer.
+    """
+
+    def __init__(self, in_channels=2, pretrained=True):
+        super().__init__()
+        self.in_channels = in_channels
+        try:
+            from torchvision.models import resnet34, ResNet34_Weights
+            weights = ResNet34_Weights.DEFAULT if pretrained else None
+            resnet = resnet34(weights=weights)
+        except Exception:
+            from torchvision.models import resnet34
+            resnet = resnet34(pretrained=pretrained)
+
+        # Input adaptation: modify first conv layer if in_channels != 3
+        if in_channels == 3:
+            self.conv1 = resnet.conv1
+        else:
+            orig_conv = resnet.conv1
+            self.conv1 = nn.Conv2d(
+                in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+            with torch.no_grad():
+                if pretrained:
+                    orig_w = orig_conv.weight
+                    if in_channels < 3:
+                        self.conv1.weight.copy_(orig_w[:, :in_channels, :, :])
+                    else:
+                        self.conv1.weight[:, :3, :, :].copy_(orig_w)
+                        extra_w = orig_w.mean(dim=1, keepdim=True)
+                        for c in range(3, in_channels):
+                            self.conv1.weight[:, c:c+1, :, :].copy_(extra_w)
+                else:
+                    nn.init.kaiming_normal_(self.conv1.weight, mode="fan_out", nonlinearity="relu")
+
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        # Encoder stages
+        self.layer1 = resnet.layer1  # 64 ch, stride 4
+        self.layer2 = resnet.layer2  # 128 ch, stride 8
+        self.layer3 = resnet.layer3  # 256 ch, stride 16
+        self.layer4 = resnet.layer4  # 512 ch, stride 32
+
+        # Bottleneck: ASPP
+        self.bottleneck = ASPP(512, 256, atrous_rates=(6, 12, 18))
+
+        # Decoder stages with skip connections
+        self.up1 = DecoderBlock(in_ch=256, skip_ch=256, out_ch=256)
+        self.up2 = DecoderBlock(in_ch=256, skip_ch=128, out_ch=128)
+        self.up3 = DecoderBlock(in_ch=128, skip_ch=64, out_ch=64)
+        self.up4 = DecoderBlock(in_ch=64, skip_ch=64, out_ch=32)
+
+        # Final 2x upsample back to original image size
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            DoubleConv(32, 32),
+        )
+
+        # Output head
+        self.head = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        x0 = self.relu(self.bn1(self.conv1(x)))  # [B, 64, H/2, W/2]
+        x1 = self.layer1(self.maxpool(x0))       # [B, 64, H/4, W/4]
+        x2 = self.layer2(x1)                     # [B, 128, H/8, W/8]
+        x3 = self.layer3(x2)                     # [B, 256, H/16, W/16]
+        x4 = self.layer4(x3)                     # [B, 512, H/32, W/32]
+
+        # Bottleneck
+        b = self.bottleneck(x4)                  # [B, 256, H/32, W/32]
+
+        # Decoder
+        d1 = self.up1(b, x3)                     # [B, 256, H/16, W/16]
+        d2 = self.up2(d1, x2)                    # [B, 128, H/8, W/8]
+        d3 = self.up3(d2, x1)                    # [B, 64, H/4, W/4]
+        d4 = self.up4(d3, x0)                    # [B, 32, H/2, W/2]
+
+        out = self.final_up(d4)                  # [B, 32, H, W]
+        return self.head(out)                    # [B, 1, H, W]
+
+
+# ---------------------------------------------------------------------------
+# Model Factory
+# ---------------------------------------------------------------------------
+def get_model(arch="unet", in_channels=2, pretrained=True, base_features=32):
+    """
+    Instantiate flood segmentation model by architecture name.
+    """
+    arch = arch.lower()
+    if arch == "resnet34":
+        return ResNet34UNet(in_channels=in_channels, pretrained=pretrained)
+    elif arch == "unet":
+        return UNet(in_channels=in_channels, base_features=base_features)
+    else:
+        raise ValueError(f"Unknown architecture '{arch}'. Supported: ['unet', 'resnet34']")
+
+
+# ---------------------------------------------------------------------------
 # Masked Loss Functions
 # ---------------------------------------------------------------------------
 class MaskedDiceLoss(nn.Module):
