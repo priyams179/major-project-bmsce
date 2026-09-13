@@ -1,0 +1,81 @@
+# ==============================================================================
+# Python & Virtual Environments
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.uv/
+*.egg-info/
+pip-log.txt
+*.tmp
+
+# ==============================================================================
+# Model Architectures vs Checkpoint Binaries
+# ==============================================================================
+# Allow the models/ python source code package
+!models/
+!models/**/
+!models/*.py
+!models/**/.gitkeep
+
+# Ignore large model checkpoints and weight binaries
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+models/**/*.pth
+models/**/*.pt
+
+# ==============================================================================
+# Remote Sensing Datasets & Processed Arrays
+# ==============================================================================
+data/
+dataset/
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Raw Satellite Archives & Folders
+*.zip
+*.tar.gz
+*.tgz
+*.SAFE/
+
+# Heavy GeoTIFF Rasters & Pyramids
+*.tif
+*.tiff
+*.vrt
+*.aux.xml
+*.ovr
+
+# ==============================================================================
+# Operational Inference & Large Pipeline Outputs
+# ==============================================================================
+output/
+predictions/
+
+# Allow evaluation metrics, training history, and figure plots
+!output/**/metrics_*.json
+!output/**/training_history.json
+!models/**/training_history.json
+!*.png
+!figures/
+!figures/**
+
+# ==============================================================================
+# OS / IDE / Logs / Cache
+# ==============================================================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.log
+.crush/
+
