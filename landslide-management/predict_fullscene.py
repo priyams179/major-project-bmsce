@@ -39,6 +39,11 @@ except ImportError:
     _TQDM_AVAILABLE = False
 
 from models import get_model
+from prepare_dataset import (
+    infer_checkpoint_channels,
+    read_dataset_manifest,
+    summarise_channels,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +383,23 @@ def main():
         "--no-tta", action="store_true",
         help="Disable 4-fold Test-Time Augmentation (faster but less accurate)"
     )
+    parser.add_argument(
+        "--channels", nargs="+", metavar="NAME", default=None,
+        help=(
+            "Scene band layout, in the order the GeoTIFF stores them, e.g. "
+            "--channels vv_pre vh_pre vv_post vh_post delta_vv delta_vh "
+            "vh_vv_ratio SR_B2 SR_B3 SR_B4 SR_B5 SR_B6 SR_B7 NDVI NDWI BSI "
+            "elevation slope sin_aspect cos_aspect profile_curv planform_curv "
+            "twi tri"
+        )
+    )
+    parser.add_argument(
+        "--manifest", default=None,
+        help=(
+            "Path to a prepared dataset directory or dataset_meta.json. "
+            "Supplies the channel layout and checks it against the scene."
+        )
+    )
     args = parser.parse_args()
 
     # --- Validate inputs ---
@@ -416,21 +438,108 @@ def main():
 
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     arch = checkpoint.get("arch", "resnet34_unet")
-    in_channels = checkpoint.get("in_channels", 14)
-    model = get_model(arch=arch, in_channels=in_channels).to(device)
+    # Fall back to the first convolution's width rather than to the old 14: a
+    # wrong default silently truncates or pads the scene instead of failing.
+    in_channels = checkpoint.get("in_channels") or infer_checkpoint_channels(checkpoint)
+    if not in_channels:
+        print(
+            "[Error] Cannot determine the model's input channel count from this "
+            "checkpoint. Re-train with train_segmentation.py, or pass a "
+            "checkpoint that records 'in_channels'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    model = get_model(arch=arch, in_channels=int(in_channels)).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+
+    channel_names = checkpoint.get("channel_names")
+    if args.manifest:
+        # A manifest describes the dataset the model was trained on; prefer it
+        # over whatever the checkpoint happens to carry.
+        manifest = read_dataset_manifest(args.manifest)
+        if not manifest["n_channels"]:
+            print(
+                f"[Warning] No dataset manifest found at '{args.manifest}'; "
+                "falling back to the checkpoint's channel layout.",
+                file=sys.stderr,
+            )
+        if manifest["channel_names"]:
+            channel_names = list(manifest["channel_names"])
+            if manifest["n_channels"] != in_channels:
+                print(
+                    f"[Error] Manifest '{args.manifest}' declares "
+                    f"{manifest['n_channels']} channels but the checkpoint "
+                    f"expects {in_channels}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif manifest["n_channels"]:
+            print(
+                "[Warning] Manifest lists a channel count but no names; "
+                "falling back to the checkpoint's layout.",
+                file=sys.stderr,
+            )
+
     print(
         f"\nLoaded {arch.upper()} checkpoint '{args.model}' "
         f"(in_channels={in_channels}, "
         f"Val IoU: {checkpoint.get('val_iou', 0.0) * 100:.2f}%)"
     )
+    if channel_names:
+        print(f"Channel layout : {summarise_channels(channel_names)}")
+    else:
+        print("Channel layout : unknown (checkpoint predates manifests); "
+              "pass --channels to record the scene's band order.")
 
     # --- 2. Load scene ---
     print("\n[1/4] Loading scene from GeoTIFF...")
     t0 = time.time()
     image_array, ref_profile = load_scene_as_array(args.input)
     print(f"  Loaded in {time.time() - t0:.1f}s")
+
+    # The model consumes bands in training order.  A GeoTIFF with the same
+    # bands in a different order looks identical to a reader but is a
+    # different image to the network, so fail loudly rather than map one scene
+    # onto another's statistics.
+    if image_array.shape[0] != in_channels:
+        print(
+            f"[Error] Scene '{args.input}' has {image_array.shape[0]} bands but "
+            f"the model expects {in_channels}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.channels:
+        if len(args.channels) != in_channels:
+            print(
+                f"[Error] --channels lists {len(args.channels)} names but the "
+                f"model expects {in_channels}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        unknown = [n for n in args.channels if n not in channel_names] if channel_names else []
+        if unknown:
+            print(
+                f"[Error] Scene bands {unknown} are not in the model's channel "
+                f"layout.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if channel_names and list(args.channels) != list(channel_names):
+            print("[Warning] Scene band order differs from the training layout.")
+            for i, (scene_band, trained) in enumerate(zip(args.channels, channel_names), 1):
+                if scene_band != trained:
+                    print(f"          band {i}: scene '{scene_band}' vs trained '{trained}'")
+        elif not channel_names:
+            print(f"  Scene bands: {', '.join(args.channels)}")
+    elif channel_names:
+        scene_bands = list(ref_profile.get("descriptions") or [])
+        if scene_bands and scene_bands != list(channel_names):
+            print(
+                "[Warning] GeoTIFF band descriptions do not match the training "
+                "layout; the model will read them positionally."
+            )
 
     # Scene statistics
     print(f"  Value range : [{image_array.min():.4f}, {image_array.max():.4f}]")

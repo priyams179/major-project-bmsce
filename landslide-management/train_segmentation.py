@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -33,6 +34,15 @@ from models import (
     MaskedFocalTverskyLoss,
     ConfusionMatrixTracker,
 )
+from prepare_dataset import (
+    S1_CHANNELS, LANDSAT_CHANNELS, DEM_CHANNELS, read_dataset_manifest,
+    discover_split_samples, summarise_channels,
+)
+
+
+# The manifest helpers and split discovery live in prepare_dataset so that
+# training, evaluation and inference cannot drift apart on either.
+_discover_samples = discover_split_samples
 
 
 # ---------------------------------------------------------------------------
@@ -76,28 +86,19 @@ class LandslideDataset(Dataset):
                 f"Expected structure: <data_dir>/train|val|test/"
             )
 
-        # Discover samples by scanning for image_*.npy files
-        import glob
-        img_files = sorted(glob.glob(os.path.join(split_dir, "image_*.npy")))
-        if not img_files:
+        # Discover samples by scanning for image_*.npy files.  prepare_dataset
+        # writes split-prefixed names (train_image_00000.npy) while the older
+        # L4S conversion wrote bare ones (image_00001.npy), so accept both.
+        self.samples = _discover_samples(split_dir, split)
+        if not self.samples:
             raise FileNotFoundError(
                 f"No 'image_*.npy' files found in '{split_dir}'. "
-                "Run preprocessing to generate patch files."
+                "Run prepare_dataset.py to generate patch files."
             )
 
-        # Build list of (img_path, mask_path, valid_path) tuples
-        self.samples = []
-        for img_path in img_files:
-            basename = os.path.basename(img_path)          # image_00001.npy
-            idx_str = basename.replace("image_", "").replace(".npy", "")  # 00001
-            mask_path = os.path.join(split_dir, f"mask_{idx_str}.npy")
-            valid_path = os.path.join(split_dir, f"valid_{idx_str}.npy")
-
-            # valid mask is optional (all-ones fallback)
-            self.samples.append((img_path, mask_path, valid_path))
-
-        if len(self.samples) == 0:
-            raise RuntimeError(f"Dataset is empty for split='{split}'.")
+        manifest = read_dataset_manifest(data_dir)
+        self.channel_names = manifest["channel_names"]
+        self.n_channels = manifest["n_channels"]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -138,6 +139,16 @@ class LandslideDataset(Dataset):
         image_t = torch.from_numpy(image)                    # (C, H, W)
         mask_t = torch.from_numpy(mask).unsqueeze(0)         # (1, H, W)
         valid_t = torch.from_numpy(valid).unsqueeze(0)       # (1, H, W)
+
+        # A stale directory can mix layouts across splits.  Catching it here
+        # names the mismatch instead of surfacing as a conv1d shape error many
+        # layers later.
+        if self.n_channels is not None and image_t.shape[0] != self.n_channels:
+            raise ValueError(
+                f"Channel mismatch in {img_path}: file has "
+                f"{image_t.shape[0]} channels, manifest declares "
+                f"{self.n_channels}. Re-run prepare_dataset.py events."
+            )
 
         return image_t, mask_t, valid_t
 
@@ -219,17 +230,21 @@ def main():
         description="Train Multi-Modal Segmentation Model for Landslide Detection"
     )
     parser.add_argument(
-        "--data-dir", default="data/processed/l4s",
+        "--data-dir", default="data/processed/s1_landsat",
         help="Root data directory containing train/val/test sub-folders "
-             "(default: data/processed/l4s)"
+             "(default: data/processed/s1_landsat)"
     )
     parser.add_argument(
         "--arch", choices=["resnet34_unet", "unet"], default="resnet34_unet",
         help="Model architecture (default: resnet34_unet)"
     )
     parser.add_argument(
-        "--in-channels", type=int, default=14, choices=[6, 14],
-        help="Input channels: 6=SAR-only monsoon, 14=full multi-modal (default: 14)"
+        "--in-channels", type=int, default=None,
+        help=(
+            "Input channels. Defaults to the count in the dataset manifest, "
+            "which is authoritative: 7=S1 only, 16=S1+Landsat, "
+            "24=S1+Landsat+DEM. Only pass this to override a wrong manifest."
+        ),
     )
     parser.add_argument(
         "--epochs", type=int, default=50,
@@ -283,8 +298,37 @@ def main():
         props = torch.cuda.get_device_properties(0)
         print(f"  GPU           : {torch.cuda.get_device_name(0)}")
         print(f"  VRAM          : {props.total_memory / 1e9:.2f} GB")
+    # --- Channel count: manifest is authoritative -------------------------
+    manifest = read_dataset_manifest(args.data_dir)
+    if manifest["n_channels"] is None:
+        if args.in_channels is None:
+            print(
+                f"[ERROR] No channel manifest under '{args.data_dir}' and no "
+                f"--in-channels given.\n"
+                f"        Re-run prepare_dataset.py events, or pass "
+                f"--in-channels explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        in_channels = args.in_channels
+        print(f"Input channels  : {in_channels} (no manifest; from CLI)")
+    elif args.in_channels is not None and args.in_channels != manifest["n_channels"]:
+        print(
+            f"[WARNING] --in-channels {args.in_channels} disagrees with the "
+            f"dataset manifest ({manifest['n_channels']} from "
+            f"{manifest['source']}). Using the manifest."
+        )
+        in_channels = manifest["n_channels"]
+    else:
+        in_channels = manifest["n_channels"]
+
+    args.in_channels = in_channels
+
     print(f"Architecture    : {args.arch}")
-    print(f"Input channels  : {args.in_channels}")
+    print(f"Input channels  : {in_channels}")
+    if manifest["channel_names"]:
+        groups = summarise_channels(manifest["channel_names"])
+        print(f"Channel layout  : {groups}")
     print(f"Mixed precision : {use_amp}")
 
     # --- Datasets ---
@@ -439,6 +483,9 @@ def main():
                 {
                     "arch": args.arch,
                     "in_channels": args.in_channels,
+                    # Recorded so inference can confirm it is fed the same
+                    # channel layout this checkpoint was trained on.
+                    "channel_names": manifest["channel_names"],
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),

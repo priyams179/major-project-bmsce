@@ -19,6 +19,7 @@ and the model will rely on SAR features instead.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -92,6 +93,28 @@ _LS_BANDS = {
     "SR_B7": "_SR_B7",   # SWIR2
     "QA_PIXEL": "_QA_PIXEL",
 }
+
+#: Native Landsat-8/9 band → role mapping.  Mirrors the Sentinel-2 layout so
+#: the optical slot can be swapped without touching downstream stacking code.
+_LS_ROLES = {
+    "SR_B2": "blue",
+    "SR_B3": "green",
+    "SR_B4": "red",
+    "SR_B5": "nir",
+    "SR_B6": "swir1",
+    "SR_B7": "swir2",
+}
+
+#: Canonical 9-channel Landsat stack order (bands + spectral indices).
+LANDSAT_CHANNELS = [
+    "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7",
+    "NDVI", "NDWI", "BSI",
+]
+
+#: Minimum valid-pixel fraction required before a Landsat scene is usable.
+#: Landsat-8/9 revisit is 16 days, so a usable pair is often the only optical
+#: opportunity during an active monsoon.
+MIN_LANDSAT_VALID_FRACTION = 0.05
 
 
 # ===========================================================================
@@ -564,6 +587,101 @@ def build_sentinel2_stack(
     return stack, vm
 
 
+def build_landsat_stack(
+    scene_dict: dict,
+    compute_indices: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Assemble a (H, W, C) numpy array from a Landsat-8/9 scene dict.
+
+    Channel order when compute_indices=True (9 channels):
+      0  SR_B2  (Blue)
+      1  SR_B3  (Green)
+      2  SR_B4  (Red)
+      3  SR_B5  (NIR)
+      4  SR_B6  (SWIR1)
+      5  SR_B7  (SWIR2)
+      6  NDVI   = (B5 - B4) / (B5 + B4)
+      7  NDWI   = (B3 - B6) / (B3 + B6)
+      8  BSI    = ((B6 + B4) - (B5 + B2)) / ((B6 + B4) + (B5 + B2))
+
+    This is the same layout as :func:`build_sentinel2_stack`, so the optical
+    slot can be swapped between sensors without touching downstream code.
+
+    Channel order when compute_indices=False (6 channels):
+      0..5  SR_B2 … SR_B7
+
+    Each band is independently normalised to [0, 1] using percentile clipping
+    over valid (non-cloud) pixels only.
+
+    Parameters
+    ----------
+    scene_dict : dict
+        Output of :func:`read_landsat_l2`.
+    compute_indices : bool
+
+    Returns
+    -------
+    stack : np.ndarray (H, W, C), float32
+    valid_mask : np.ndarray (H, W), float32
+    """
+    vm = scene_dict["valid_mask"]
+
+    band_keys = [k for k, role in _LS_ROLES.items() if k in scene_dict]
+    missing = [k for k in _LS_ROLES if k not in scene_dict]
+    if missing:
+        log.warning("build_landsat_stack: missing bands %s", missing)
+
+    bands_raw   = [scene_dict[k] for k in band_keys]
+    band_names  = list(band_keys)
+
+    bands_norm = [normalize_band(b, valid_mask=vm) for b in bands_raw]
+
+    if compute_indices and len(bands_raw) >= 5:
+        blue, green, red, nir, swir1 = bands_raw[:5]
+
+        ndvi = compute_ndvi(nir, red)
+        ndwi = compute_ndwi(green, swir1)
+        bsi  = compute_bsi(blue, red, nir, swir1)
+
+        bands_norm += [
+            normalize_band(ndvi, valid_mask=vm),
+            normalize_band(ndwi, valid_mask=vm),
+            normalize_band(bsi, valid_mask=vm),
+        ]
+        band_names += ["NDVI", "NDWI", "BSI"]
+    elif compute_indices:
+        log.warning(
+            "build_landsat_stack: need 5 bands for indices, got %d. "
+            "Skipping NDVI/NDWI/BSI.", len(bands_raw)
+        )
+
+    stack = np.stack(bands_norm, axis=-1).astype(np.float32)  # (H, W, C)
+    log.info(
+        "Landsat stack: shape=%s  channels=%s",
+        stack.shape,
+        band_names,
+    )
+    return stack, vm
+
+
+def _scene_nir_red(scene_dict: dict) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return (NIR, Red) for a Sentinel-2 or Landsat scene dict.
+
+    Lets dNDVI and other change indices be computed without the caller
+    branching on sensor.
+    """
+    if "B08" in scene_dict:              # Sentinel-2
+        return scene_dict["B08"], scene_dict["B04"]
+    if "SR_B5" in scene_dict:            # Landsat-8/9
+        return scene_dict["SR_B5"], scene_dict["SR_B4"]
+    raise KeyError(
+        "Scene dict has neither Sentinel-2 (B08/B04) nor "
+        "Landsat (SR_B5/SR_B4) NIR/Red bands."
+    )
+
+
 def build_bitemporal_dndvi(
     pre_scene_dict: dict,
     post_scene_dict: dict,
@@ -585,8 +703,11 @@ def build_bitemporal_dndvi(
     -------
     np.ndarray (float32, [0, 1])  same spatial shape as inputs.
     """
-    ndvi_pre  = compute_ndvi(pre_scene_dict["B08"],  pre_scene_dict["B04"])
-    ndvi_post = compute_ndvi(post_scene_dict["B08"], post_scene_dict["B04"])
+    nir_pre, red_pre     = _scene_nir_red(pre_scene_dict)
+    nir_post, red_post   = _scene_nir_red(post_scene_dict)
+
+    ndvi_pre  = compute_ndvi(nir_pre,  red_pre)
+    ndvi_post = compute_ndvi(nir_post, red_post)
 
     both_valid = (
         pre_scene_dict["valid_mask"].astype(bool)
@@ -643,6 +764,113 @@ def _save_geotiff(
         dst.write(data.astype(np.float32))
 
     log.info("Saved: %s  shape=%s", output_path, data.shape)
+
+
+def preprocess_landsat_scene(
+    scene_dir: str | Path,
+    output_dir: str | Path,
+    min_valid_fraction: float = MIN_LANDSAT_VALID_FRACTION,
+) -> dict:
+    """
+    Full Landsat-8/9 Collection 2 Level-2 preprocessing pipeline.
+
+    Steps
+    -----
+    1. Read SR_B2…SR_B7 + QA_PIXEL, apply the USGS scale/offset.
+    2. Build the cloud/shadow/cirrus mask from QA_PIXEL.
+    3. Compute NDVI, NDWI, BSI.
+    4. Normalise each band independently over valid pixels.
+    5. Save individual band GeoTIFFs + the 9-channel stack.
+
+    Parameters
+    ----------
+    scene_dir : Path
+        Directory containing the extracted Landsat C2 L2 product.
+    output_dir : Path
+        Directory to write processed outputs.
+    min_valid_fraction : float
+        Raise if the scene is more than (1 − this) masked.  Landsat's 16-day
+        revisit means a rejected scene may be the only optical opportunity
+        during a monsoon event, so this is a warning, not a hard default.
+
+    Returns
+    -------
+    dict of output file paths:
+        'stack'       – 9-channel band + indices stack
+        'valid_mask'  – binary cloud/shadow mask
+        'ndvi'        – raw (pre-normalised) NDVI
+        'ndwi'        – raw (pre-normalised) NDWI
+        'bsi'         – raw (pre-normalised) BSI
+    """
+    scene_dir  = Path(scene_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    scene_name = scene_dir.stem
+    log.info("Preprocessing Landsat scene: %s", scene_name)
+
+    sd = read_landsat_l2(scene_dir)
+    profile = sd["profile"]
+    valid_mask = sd["valid_mask"]
+
+    valid_frac = float(valid_mask.mean())
+    if valid_frac < min_valid_fraction:
+        log.warning(
+            "Landsat scene %s is only %.1f%% valid (below %.1f%%). "
+            "Optical features for this event will be sparse.",
+            scene_name, valid_frac * 100, min_valid_fraction * 100,
+        )
+
+    nir   = sd["SR_B5"]
+    red   = sd["SR_B4"]
+    blue  = sd["SR_B2"]
+    green = sd["SR_B3"]
+    swir1 = sd["SR_B6"]
+
+    ndvi = compute_ndvi(nir, red)
+    ndwi = compute_ndwi(green, swir1)
+    bsi  = compute_bsi(blue, red, nir, swir1)
+
+    stack, _ = build_landsat_stack(sd, compute_indices=True)
+
+    out_files: dict = {}
+
+    def _out(name: str) -> Path:
+        return output_dir / f"{scene_name}_{name}.tif"
+
+    _save_geotiff(stack, profile, _out("stack"))
+    out_files["stack"] = str(_out("stack"))
+
+    _save_geotiff(valid_mask, profile, _out("valid_mask"))
+    out_files["valid_mask"] = str(_out("valid_mask"))
+
+    for name, arr in [("ndvi", ndvi), ("ndwi", ndwi), ("bsi", bsi)]:
+        _save_geotiff(arr, profile, _out(name))
+        out_files[name] = str(_out(name))
+
+    for band_key in _LS_ROLES:
+        if band_key in sd:
+            fname = band_key.lower()
+            _save_geotiff(sd[band_key], profile, _out(fname))
+            out_files[fname] = str(_out(fname))
+
+    # Record the channel order so downstream stacking and RGB previews do
+    # not have to hard-code positions.
+    manifest = {
+        "sensor":     "landsat",
+        "scene":      scene_name,
+        "channels":   LANDSAT_CHANNELS if out_files.get("stack") else [],
+        "valid_fraction": valid_frac,
+    }
+    with open(output_dir / f"{scene_name}_manifest.json", "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    out_files["manifest"] = str(output_dir / f"{scene_name}_manifest.json")
+
+    log.info(
+        "Landsat preprocessing complete for %s (valid %.1f%%)",
+        scene_name, valid_frac * 100,
+    )
+    return out_files
 
 
 def preprocess_sentinel2_scene(
@@ -721,6 +949,73 @@ def preprocess_sentinel2_scene(
     return out_files
 
 
+def _align_to_reference(scene: dict, reference: dict) -> dict:
+    """
+    Reproject every raster in *scene* onto *reference*'s grid.
+
+    Pre/post pairs are not guaranteed to share a grid: scenes from
+    different WRS paths (or with slightly different footprints) come back
+    with different shapes and transforms, and bitemporal differencing
+    needs both on one grid.  Masks are resampled with nearest neighbour,
+    reflectance and indices with bilinear.  Returns *scene* unchanged when
+    the grids already match.
+
+    Parameters
+    ----------
+    scene : dict
+        Scene dict as returned by ``read_landsat_l2`` / ``read_sentinel2_l2a``.
+    reference : dict
+        Scene whose grid wins.  Its ``profile`` becomes the output profile.
+
+    Returns
+    -------
+    dict
+        Shallow copy with every raster on the reference grid.
+    """
+    ref_shape = tuple(reference["valid_mask"].shape)
+    ref_profile = reference["profile"]
+    src_profile = scene["profile"]
+
+    needs = [
+        k for k, v in scene.items()
+        if isinstance(v, np.ndarray) and v.shape != ref_shape
+    ]
+    if not needs:
+        return scene
+
+    aligned = dict(scene)
+    for key in needs:
+        value = scene[key]
+        if value.ndim != 2:
+            raise RuntimeError(
+                f"Cannot align '{key}': expected a 2-D raster, got {value.shape}"
+            )
+        is_mask = "mask" in key.lower() or key.lower().startswith("qa")
+        dst = np.empty(ref_shape, dtype=np.float32)
+        reproject(
+            source=value.astype(np.float32),
+            destination=dst,
+            src_transform=src_profile["transform"],
+            src_crs=src_profile["crs"],
+            dst_transform=ref_profile["transform"],
+            dst_crs=ref_profile["crs"],
+            resampling=Resampling.nearest if is_mask else Resampling.bilinear,
+        )
+        if is_mask:
+            dst = np.rint(dst).astype(value.dtype)
+        else:
+            dst = dst.astype(value.dtype, copy=False)
+        aligned[key] = dst
+
+    aligned["profile"] = ref_profile
+    log.info(
+        "Grids differ %s vs reference %s; reprojected %d raster(s) for the "
+        "bitemporal pair.",
+        tuple(scene["valid_mask"].shape), ref_shape, len(needs),
+    )
+    return aligned
+
+
 def preprocess_bitemporal(
     pre_scene_dir: str | Path,
     post_scene_dir: str | Path,
@@ -732,39 +1027,53 @@ def preprocess_bitemporal(
 
     Parameters
     ----------
-    pre_scene_dir  : Path to pre-event scene.
-    post_scene_dir : Path to post-event scene.
-    output_dir     : Output directory.
-    sensor         : 'sentinel2' or 'landsat' (Landsat bitemporal not yet implemented).
+pre_scene_dir  : Path to pre-event scene.
+        post_scene_dir : Path to post-event scene.
+        output_dir     : Output directory.
+        sensor         : 'sentinel2' (S2 L2A .SAFE) or 'landsat' (C2 L2 dir).
 
     Returns
     -------
-    dict with keys from both scenes plus 'dndvi'.
+    dict with keys 'sensor', 'pre', 'post', and 'dndvi'.
     """
     output_dir = Path(output_dir)
 
-    if sensor.lower() in ("sentinel2", "s2"):
+    sensor_key = sensor.lower()
+
+    if sensor_key in ("sentinel2", "s2"):
         pre_files  = preprocess_sentinel2_scene(pre_scene_dir,  output_dir / "pre")
         post_files = preprocess_sentinel2_scene(post_scene_dir, output_dir / "post")
 
         pre_sd  = read_sentinel2_l2a(pre_scene_dir)
         post_sd = read_sentinel2_l2a(post_scene_dir)
 
-        dndvi = build_bitemporal_dndvi(pre_sd, post_sd)
-        profile = pre_sd["profile"]
+    elif sensor_key in ("landsat", "ls"):
+        pre_files  = preprocess_landsat_scene(pre_scene_dir,  output_dir / "pre")
+        post_files = preprocess_landsat_scene(post_scene_dir, output_dir / "post")
 
-        dndvi_path = output_dir / "dndvi.tif"
-        _save_geotiff(dndvi, profile, dndvi_path)
+        pre_sd  = read_landsat_l2(pre_scene_dir)
+        post_sd = read_landsat_l2(post_scene_dir)
 
-        return {
-            "pre":   pre_files,
-            "post":  post_files,
-            "dndvi": str(dndvi_path),
-        }
     else:
-        raise NotImplementedError(
-            f"Bitemporal preprocessing for sensor '{sensor}' is not yet implemented."
+        raise ValueError(
+            f"Unknown sensor '{sensor}'. Use 'sentinel2' or 'landsat'."
         )
+
+    # Different WRS paths give different native grids; dNDVI needs one.
+    post_sd = _align_to_reference(post_sd, pre_sd)
+
+    dndvi = build_bitemporal_dndvi(pre_sd, post_sd)
+    profile = pre_sd["profile"]
+
+    dndvi_path = output_dir / "dndvi.tif"
+    _save_geotiff(dndvi, profile, dndvi_path)
+
+    return {
+        "sensor": sensor_key,
+        "pre":    pre_files,
+        "post":   post_files,
+        "dndvi":  str(dndvi_path),
+    }
 
 
 # ===========================================================================
@@ -822,8 +1131,17 @@ def main(argv: Optional[List[str]] = None) -> None:
                     log.info("  [%s] %s: %s", k, kk, vv)
             else:
                 log.info("  %s: %s", k, v)
+    elif args.sensor.lower() in ("landsat", "ls"):
+        log.info("Single scene mode (Landsat): scene=%s", args.pre)
+        result = preprocess_landsat_scene(
+            scene_dir=args.pre,
+            output_dir=output_dir,
+        )
+        log.info("Outputs:")
+        for k, v in result.items():
+            log.info("  [%s]: %s", k, v)
     else:
-        log.info("Single scene mode: scene=%s", args.pre)
+        log.info("Single scene mode (Sentinel-2): scene=%s", args.pre)
         result = preprocess_sentinel2_scene(
             scene_dir=args.pre,
             output_dir=output_dir,

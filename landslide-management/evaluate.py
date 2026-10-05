@@ -8,18 +8,19 @@ Computes:
   - Precision-Recall curve generation
   - Per-region performance breakdown (Western Ghats, Himalayas, Northeast, Nilgiris)
   - Confusion matrix heatmap visualization
-  - Verification against Landslide4Sense global benchmark targets:
-      * IoU >= 0.55
-      * F1-Score >= 0.70
-      * Recall >= 0.75
+  - Comparison against Landslide4Sense reference targets (IoU >= 0.55,
+    F1 >= 0.70, Recall >= 0.75).  Those come from a Sentinel-2 benchmark and are
+    a floor for the legacy path, not a goal for the six-event S1+Landsat split.
+
+The input width and patch layout are read from the dataset manifest and the
+checkpoint, so a 24-channel S1+Landsat stack is never fed to a 14-channel model.
 
 Usage:
-    python evaluate.py --model models/best_model.pth --data-dir data/processed/l4s --split test
-    python evaluate.py --model models/best_model.pth --data-dir data/processed/l4s --pr-curve
+    python evaluate.py --model models/best_model.pth --data-dir data/processed/s1_landsat --split test
+    python evaluate.py --model models/best_model.pth --data-dir data/processed/l4s --pr-curve   # legacy 14-channel L4S
 """
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -31,13 +32,23 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from models import ConfusionMatrixTracker, compute_metrics, get_model, optimal_threshold
+from prepare_dataset import (
+    discover_split_samples as _discover_samples,
+    infer_checkpoint_channels,
+    read_dataset_manifest,
+)
 
 
 # ---------------------------------------------------------------------------
 # Test Dataset Loader
 # ---------------------------------------------------------------------------
 class EvalDataset(Dataset):
-    """Evaluation dataset loading .npy image, mask, and valid_mask patches."""
+    """Evaluation dataset loading .npy image, mask, and valid patches.
+
+    Accepts both the current ``<split>_image_*.npy`` layout and the legacy
+    unprefixed ``image_*.npy`` layout; the channel axis is resolved from the
+    dataset manifest instead of a hardcoded allow-list of widths.
+    """
 
     def __init__(self, data_dir: str, split: str = "test"):
         self.data_dir = data_dir
@@ -46,10 +57,17 @@ class EvalDataset(Dataset):
 
         # Check for split directory or direct files
         search_dir = self.split_dir if os.path.exists(self.split_dir) else data_dir
+        self.samples = _discover_samples(search_dir, split)
+        if not self.samples:
+            raise FileNotFoundError(
+                f"No 'image_*.npy' files found in '{search_dir}'. "
+                "Run prepare_dataset.py to generate patch files."
+            )
 
-        self.image_files = sorted(glob.glob(os.path.join(search_dir, "image_*.npy")))
-        self.mask_files = sorted(glob.glob(os.path.join(search_dir, "mask_*.npy")))
-        self.valid_files = sorted(glob.glob(os.path.join(search_dir, "valid_*.npy")))
+        manifest = read_dataset_manifest(data_dir)
+        # None for a legacy dataset written before manifests existed; the
+        # channel axis is then settled per patch from the array shape alone.
+        self.n_channels = manifest["n_channels"]
 
         # Check metadata for regions
         self.meta = {}
@@ -62,21 +80,36 @@ class EvalDataset(Dataset):
                 pass
 
     def __len__(self) -> int:
-        return len(self.image_files)
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_np = np.load(self.image_files[idx]).astype(np.float32)
-        mask_np = np.load(self.mask_files[idx]).astype(np.float32)
+        img_path, mask_path, valid_path = self.samples[idx]
 
-        if idx < len(self.valid_files):
-            valid_np = np.load(self.valid_files[idx]).astype(np.float32)
+        img_np = np.load(img_path).astype(np.float32)
+        mask_np = np.load(mask_path).astype(np.float32)
+
+        if img_np.ndim == 2:
+            img_np = img_np[np.newaxis, ...]
+        elif img_np.ndim == 3:
+            if self.n_channels is not None:
+                if img_np.shape[0] != self.n_channels:
+                    # (H, W, C) → (C, H, W); (C, H, W) already matches.
+                    img_np = np.transpose(img_np, (2, 0, 1))
+            elif img_np.shape[-1] < img_np.shape[0]:
+                # No manifest: assume the smaller axis is the channel axis,
+                # which holds for both square patches and any plausible stack.
+                img_np = np.transpose(img_np, (2, 0, 1))
+
+        if self.n_channels is not None and img_np.shape[0] != self.n_channels:
+            raise ValueError(
+                f"{img_path} has {img_np.shape[0]} channels but the manifest "
+                f"declares {self.n_channels}. Re-generate the dataset."
+            )
+
+        if os.path.exists(valid_path):
+            valid_np = np.load(valid_path).astype(np.float32)
         else:
             valid_np = np.ones_like(mask_np, dtype=np.float32)
-
-        # Ensure channel-first format (C, H, W)
-        if img_np.ndim == 3 and img_np.shape[0] not in (2, 3, 5, 6, 12, 14):
-            # Probably (H, W, C) -> transpose
-            img_np = np.transpose(img_np, (2, 0, 1))
 
         if mask_np.ndim == 2:
             mask_np = mask_np[np.newaxis, ...]
@@ -96,7 +129,14 @@ def load_checkpoint_model(checkpoint_path: str, device: torch.device) -> Tuple[n
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     arch = checkpoint.get("arch", "resnet34_unet")
-    in_channels = checkpoint.get("in_channels", 14)
+    in_channels = checkpoint.get("in_channels") or infer_checkpoint_channels(checkpoint)
+    if not in_channels:
+        raise ValueError(
+            f"Cannot determine the model's input channel count from {checkpoint_path}. "
+            "It records neither 'in_channels' nor a readable convolution weight."
+        )
+    in_channels = int(in_channels)
+    checkpoint.setdefault("in_channels", in_channels)
 
     model = get_model(arch=arch, in_channels=in_channels, pretrained=False).to(device)
     if "model_state_dict" in checkpoint:
@@ -267,7 +307,7 @@ def print_evaluation_report(metrics: dict, checkpoint_info: Optional[dict] = Non
         print(f"Input Channels: {checkpoint_info.get('in_channels', 'N/A')}")
         print(f"Trained Epoch:  {checkpoint_info.get('epoch', 'N/A')}")
     print("-" * 75)
-    print(f"{'Metric':<25} | {'Achieved':<12} | {'Target (L4S)':<14} | {'Status'}")
+    print(f"{'Metric':<25} | {'Achieved':<12} | {'L4S reference':<14} | Status")
     print("-" * 75)
 
     iou_val = metrics["iou"] * 100
@@ -276,11 +316,18 @@ def print_evaluation_report(metrics: dict, checkpoint_info: Optional[dict] = Non
     prec_val = metrics["precision"] * 100
     acc_val = metrics["accuracy"] * 100
 
-    print(f"{'Landslide IoU':<25} | {iou_val:>10.2f}% | {'≥ 55.0%':<14} | {'PASS' if iou_val >= 55.0 else 'CHECK'}")
-    print(f"{'F1-Score / Dice':<25} | {f1_val:>10.2f}% | {'≥ 70.0%':<14} | {'PASS' if f1_val >= 70.0 else 'CHECK'}")
-    print(f"{'Recall (Sensitivity)':<25} | {rec_val:>10.2f}% | {'≥ 75.0%':<14} | {'PASS' if rec_val >= 75.0 else 'CHECK'}")
-    print(f"{'Precision':<25} | {prec_val:>10.2f}% | {'≥ 65.0%':<14} | {'PASS' if prec_val >= 65.0 else 'CHECK'}")
-    print(f"{'Overall Accuracy':<25} | {acc_val:>10.2f}% | {'≥ 95.0%':<14} | {'PASS' if acc_val >= 95.0 else 'CHECK'}")
+    def _row(label: str, value: float, reference: float) -> None:
+        print(f"{label:<25} | {value:>10.2f}% | {'≥ ' + format(reference, '.1f') + '%':<14} | "
+              f"{'PASS' if value >= reference else 'CHECK'}")
+
+    # These targets come from the Sentinel-2 Landslide4Sense benchmark.  They are
+    # a sanity floor, not a goal for the six-event S1+Landsat split, where the
+    # held-out event changes terrain entirely.
+    _row("Landslide IoU", iou_val, 55.0)
+    _row("F1-Score / Dice", f1_val, 70.0)
+    _row("Recall (Sensitivity)", rec_val, 75.0)
+    _row("Precision", prec_val, 65.0)
+    _row("Overall Accuracy", acc_val, 95.0)
     print("-" * 75)
     print(f"Pixel Counts: TP={metrics['tp']:,} | FP={metrics['fp']:,} | FN={metrics['fn']:,} | TN={metrics['tn']:,}")
     print("=" * 75)
@@ -292,7 +339,8 @@ def print_evaluation_report(metrics: dict, checkpoint_info: Optional[dict] = Non
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Landslide Segmentation Models")
     parser.add_argument("--model", required=True, help="Path to best_model.pth checkpoint")
-    parser.add_argument("--data-dir", default="data/processed/l4s", help="Path to processed dataset directory")
+    parser.add_argument("--data-dir", default="data/processed/s1_landsat",
+                        help="Path to a processed dataset directory (channel layout read from its manifest)")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"], help="Dataset split to evaluate")
     parser.add_argument("--batch-size", type=int, default=16, help="Evaluation batch size")
     parser.add_argument("--threshold", type=float, default=0.5, help="Classification probability threshold")

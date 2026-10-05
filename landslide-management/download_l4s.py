@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Landslide4Sense (L4S) Dataset Downloader
+Landslide4Sense (L4S) Dataset Downloader  --  LEGACY
+
+Not part of the active pipeline.  Kept for reproducing published baselines and
+for the legacy `prepare_dataset.py l4s` path.
+
+Why it is legacy: L4S labels are derived from Sentinel-2 imagery, and the active
+stack replaces Sentinel-2 with Landsat on a Sentinel-1 backbone.  Training on
+L4S evaluates the model on the sensor it was meant to supersede, and its
+event-level Indian labels do not cover the six events in the S1+Landsat catalog.
+Use `download_sentinel.py` and `download_landsat.py` for current work.
 
 Downloads the Landslide4Sense benchmark dataset:
   - 3,799 multi-spectral image patches (14 channels: 12 Sentinel-2 + elevation + slope)

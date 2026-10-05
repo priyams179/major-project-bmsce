@@ -2,7 +2,14 @@
 
 An end-to-end, production-grade deep learning and remote sensing pipeline for **landslide detection and mapping**, tailored for India's high-vulnerability terrain: the **Western Ghats**, the **Himalayas**, and **Northeast India**.
 
-The system ingests **Sentinel-1 SAR**, **Sentinel-2 MSI / Landsat Optical**, and **Copernicus DEM (GLO-30)** elevation data to train semantic segmentation and bi-temporal change detection models, generating geocoded disaster response GeoTIFFs (EPSG:4326).
+The system ingests **Sentinel-1 SAR**, **Landsat-8/9 Collection-2 L2** optical, and **Copernicus DEM (GLO-30)** elevation data to train semantic segmentation and bi-temporal change detection models, generating geocoded disaster response GeoTIFFs (EPSG:4326).
+
+The active stack is 24 channels in a fixed order: 7 Sentinel-1
+(`vv_pre, vh_pre, vv_post, vh_post, delta_vv, delta_vh, vh_vv_ratio`), 9 Landsat
+(`SR_B2…SR_B7, NDVI, NDWI, BSI`), 8 DEM features. Sentinel-2 and the
+Landslide4Sense benchmark remain supported as a legacy path, not the default:
+L4S labels are derived from Sentinel-2 imagery, so keeping it as the primary
+training set would evaluate the model on the sensor it is meant to replace.
 
 ---
 
@@ -12,7 +19,7 @@ The system ingests **Sentinel-1 SAR**, **Sentinel-2 MSI / Landsat Optical**, and
   During the Indian Southwest Monsoon, persistent cloud cover reaches **85%–98%** over the Western Ghats and Himalayas. Optical satellites are blinded for **14 to 85+ days**. This pipeline prioritizes **Sentinel-1 C-band SAR (VV + VH)** to achieve rapid detection within **24–48 hours** of an event.
 - **Dual-Model Strategy:**
   - **Phase 1: Multi-Modal Semantic Segmentation (`ResNet34UNet` with ASPP):**
-    Pretrained ImageNet ResNet-34 backbone adapted for arbitrary input channels (6-channel SAR-only monsoon mode or 14-channel full multi-modal mode) with Atrous Spatial Pyramid Pooling for multi-scale feature extraction.
+    Pretrained ImageNet ResNet-34 backbone adapted for arbitrary input channels (7-channel SAR-only monsoon mode, 16-channel S1+Landsat, or the full 24-channel S1+Landsat+DEM stack) with Atrous Spatial Pyramid Pooling for multi-scale feature extraction. The channel count is read from the dataset manifest rather than passed by hand.
   - **Phase 2: Bi-Temporal Change Detection (`SNUNetCD`):**
     Siamese ResNet-18 encoders with dense nested skip connections (U-Net++ topology) and Ensemble Channel Attention Modules (ECAM) to compare pre- and post-disaster passes and isolate newly triggered scars from permanent bare ground.
 - **Extreme Class Imbalance Mitigation:**
@@ -32,13 +39,15 @@ landslide-management/
 ├── requirements.txt             # Python dependencies
 ├── README.md                    # System documentation and operational guide
 │
-├── download_l4s.py              # Landslide4Sense benchmark dataset downloader & validator
-├── download_sentinel.py         # Sentinel-1/2 & Copernicus DEM downloader with India event profiles
+├── download_landsat.py          # Landsat-8/9 Collection-2 L2 search & download via USGS M2M
+├── download_sentinel.py         # Sentinel-1 (CDSE) & Copernicus DEM downloader with India event profiles
+├── download_l4s.py              # Landslide4Sense benchmark downloader (legacy, Sentinel-2 based)
 │
-├── preprocess_sar.py            # Sentinel-1 GRD calibration (DN -> σ° dB), noise removal, Refined Lee
-├── preprocess_optical.py        # Sentinel-2/Landsat BOA reflectance, SCL cloud masking, NDVI/dNDVI/BSI
+├── preprocess_sar.py            # Sentinel-1 GRD calibration (DN -> σ° dB), noise removal, Refined Lee,
+│                                #   phase-correlation co-registration, 7-band bitemporal stack
+├── preprocess_optical.py        # Landsat/Sentinel-2 BOA reflectance, QA cloud masking, NDVI/NDWI/BSI, dNDVI
 ├── preprocess_dem.py            # Copernicus DEM GLO-30 terrain features: Slope, Aspect, Curvatures, TWI, TRI
-├── prepare_dataset.py           # Co-registration, multi-modal stacking, balanced patch extraction, spatial CV
+├── prepare_dataset.py           # Inventory polygon rasterisation, multi-modal stacking, event-level CV splits
 │
 ├── models/                      # Deep learning architecture package
 │   ├── __init__.py              # Public model and loss exports
@@ -99,33 +108,106 @@ pip install -r requirements.txt
 # List all pre-configured Indian landslide events
 python download_sentinel.py --list-events
 
-# Download Copernicus DEM GLO-30 for Wayanad
-python download_sentinel.py --event wayanad_2024 --dem-only --output data/raw/dem
+# Sentinel-1 GRD pair (pre/post), keyless via the sentinel-s1-l1c mirror;
+# with CDSE_CLIENT_ID/SECRET set it uses the official CDSE zip route instead
+python download_sentinel.py --event wayanad_2024 --sar --output data/raw/s1
 
-# Check or organize Landslide4Sense benchmark dataset
-python download_l4s.py --check --data-dir data/l4s
+# Landsat-8/9 Collection-2 L2, keyless by default (Planetary Computer mirror);
+# set USGS_M2M_API_KEY (or pass --backend m2m) for the official USGS route
+python download_landsat.py --event wayanad_2024 --output data/raw/landsat
+python download_landsat.py --list-events
+python download_landsat.py --event wayanad_2024 --search-only   # coverage check
+
+# Copernicus DEM GLO-30
+python download_sentinel.py --event wayanad_2024 --dem-only --output data/raw/dem
 ```
+
+No credentials are required: both downloaders fall back to anonymous open-data
+mirrors (Microsoft Planetary Computer for Landsat, Element84's `sentinel-s1-l1c`
+bucket for Sentinel-1) and write the same directory layouts the preprocess steps
+expect. Optional credentials switch to the official agency routes:
+
+| Variable | Used by | Source | Without it |
+|---|---|---|---|
+| `CDSE_CLIENT_ID`, `CDSE_CLIENT_SECRET` | Sentinel-1 (official CDSE zips) | [dataspace.copernicus.eu](https://dataspace.copernicus.eu) | keyless `sentinel-s1-l1c` mirror |
+| `USGS_M2M_API_KEY` | Landsat-8/9 (official USGS M2M) | [m2m.cr.usgs.gov](https://m2m.cr.usgs.gov) | keyless Planetary Computer mirror (`--backend pc`) |
+
+If you do want the official USGS route, generating the key is only half of it.
+M2M access has to be approved separately: in [ERS](https://ers.cr.usgs.gov) open
+**Access Request → Access Controls → Request Access**, choose *Access to EE's
+Machine to Machine interface (MACHINE)*, and wait for the USGS team to grant it.
+Requests are refused with a permission error until then, which looks like a bad
+key.
+
+`download_landsat.py` keeps only the `SR_B*` bands plus `QA_PIXEL`, on both
+backends. That is deliberate: the M2M bundle product returns every file of a
+scene, thermal bands and browse included, at roughly an order of magnitude more
+bytes for two events' worth of data we never read.
 
 ### Step 2: Preprocess Radar, Optical, and Topographic Data
 ```bash
-# 1. SAR Preprocessing: Calibration to σ° dB, noise removal, Refined Lee speckle filter
-python preprocess_sar.py --pre data/raw/S1_pre.SAFE --post data/raw/S1_post.SAFE --output output/sar
+# 1. SAR: calibration to σ° dB, noise removal, Refined Lee speckle filter,
+#    phase-correlation co-registration, then the 7-band bitemporal stack
+python preprocess_sar.py --pre data/raw/s1/S1_pre.SAFE --post data/raw/s1/S1_post.SAFE \
+    --output output/sar/wayanad_2024
+# -> output/sar/wayanad_2024/change/sar_stack.tif  (vv_pre … vh_vv_ratio)
 
-# 2. Optical Preprocessing: SCL cloud masking, reflectance rescaling, NDVI, dNDVI, BSI
-python preprocess_optical.py --pre data/raw/S2_pre --post data/raw/S2_post --sensor sentinel2 --output output/optical
+# 2. Optical: Landsat SR rescaling, QA cloud masking, NDVI, NDWI, BSI
+python preprocess_optical.py --pre data/raw/landsat/L8_pre --post data/raw/landsat/L8_post \
+    --sensor landsat --output output/optical/wayanad_2024
 
-# 3. DEM Topographic Feature Extraction: Slope (Horn's), Aspect, Curvatures, TWI, TRI
-python preprocess_dem.py --aoi wayanad --target-raster output/sar/vv_norm.tif --output output/dem
+# 3. DEM features: slope (Horn), aspect, curvatures, TWI, TRI
+python preprocess_dem.py --aoi wayanad_2024 \
+    --target-raster output/sar/wayanad_2024/change/sar_stack.tif --output output/dem
 ```
 
-### Step 3: Prepare Dataset & Spatial Cross-Validation Splits
+### Step 3: Prepare Dataset & Event-Level Splits
 ```bash
-# Process Landslide4Sense benchmark (128x128 patches, 14 channels)
-python prepare_dataset.py l4s --l4s-dir data/l4s --output data/processed/l4s
+# Multi-event dataset from inventory polygons (active pipeline, 24 channels)
+python prepare_dataset.py events \
+    --config data/config/events.json \
+    --output data/processed/s1_landsat \
+    --patch-size 256 --stride 128 \
+    --val-events tupul_2022 pettimudi_2020 \
+    --test-events irshalwadi_2023 joshimath_2023
 
-# Or process custom Indian multi-modal disaster stack
+# Single scene
 python prepare_dataset.py custom --config scene_config.json --output data/processed/wayanad
+
+# Legacy Landslide4Sense benchmark (Sentinel-2, 14 channels)
+python prepare_dataset.py l4s --l4s-dir data/l4s --output data/processed/l4s
 ```
+
+`events.json` gives one entry per event, each with either a `mask` GeoTIFF or a
+`polygon_file`, plus the raster paths:
+
+```json
+{
+  "events": [
+    {
+      "event_name": "wayanad_2024",
+      "lat": 11.51, "lon": 76.15,
+      "polygon_file": "data/inventory/wayanad_2024.geojson",
+      "sar_stack": "output/sar/wayanad_2024/change/sar_stack.tif",
+      "landsat":   "output/optical/wayanad_2024/post/stack.tif",
+      "dem":       "output/dem/wayanad_2024/terrain_stack.tif"
+    }
+  ],
+  "val_events":  ["tupul_2022", "pettimudi_2020"],
+  "test_events": ["irshalwadi_2023", "joshimath_2023"]
+}
+```
+
+Channel order is fixed and written to `dataset_meta.json`: 7 Sentinel-1, then
+9 Landsat, then 8 DEM. Splitting is by whole event, so the test score measures
+transfer to terrain the model never saw — adjacent patches of one landslide
+share slope, land cover and radar geometry, and splitting them randomly inflates
+the score.
+
+Pixels outside every inventory polygon are marked invalid and skipped by the
+loss. A configurable ring around each polygon is kept as real negatives
+(`--negative-margin`, default 150 m), because that band is where a fresh scar
+must be told apart from the stable slope above it.
 
 ### Step 4: Model Training
 
@@ -133,8 +215,7 @@ python prepare_dataset.py custom --config scene_config.json --output data/proces
 ```bash
 python train_segmentation.py \
     --arch resnet34_unet \
-    --in-channels 14 \
-    --data-dir data/processed/l4s \
+    --data-dir data/processed/s1_landsat \
     --epochs 50 \
     --batch-size 16 \
     --loss focal_tversky \
@@ -142,11 +223,15 @@ python train_segmentation.py \
     --output-dir models/segmentation
 ```
 
+`--in-channels` is read from the dataset manifest and should not be passed. The
+manifest is authoritative; a flag that disagrees with it is reported and
+overridden.
+
 #### Phase 2: Bi-Temporal Change Detection (SNUNet-CD)
 ```bash
 python train_change_detection.py \
     --arch snunet \
-    --in-channels 5 \
+    --in-channels 7 \
     --data-dir data/processed/bitemporal \
     --epochs 50 \
     --batch-size 8 \
@@ -158,24 +243,30 @@ python train_change_detection.py \
 # Compute exact global dataset metrics and generate PR curve
 python evaluate.py \
     --model models/segmentation/best_model.pth \
-    --data-dir data/processed/l4s \
+    --data-dir data/processed/s1_landsat \
     --split test \
     --pr-curve \
     --output-dir output/eval
 ```
 
-**Target Benchmarks (Landslide4Sense Test Split):**
+**Reference targets (Landslide4Sense test split, Sentinel-2 baseline):**
 - **IoU:** $\ge 55.0\%$ (SOTA baseline: $\sim 53\% - 58\%$)
 - **F1-Score / Dice:** $\ge 70.0\%$ (SOTA baseline: $\sim 73\% - 78\%$)
 - **Recall:** $\ge 75.0\%$ (Prioritized via $\beta=0.7$ Focal-Tversky weighting)
 - **Precision:** $\ge 65.0\%$
+
+These numbers come from the L4S benchmark and are not directly comparable to
+the six-event S1+Landsat split. With one event per split, held-out IoU varies far
+more between events than it does between random patch subsets: Irshalwadi and
+Joshimath differ in terrain, season and radar geometry. Expect the spread across
+events to be the honest signal, and treat any single figure with suspicion.
 
 ### Step 6: Full-Scene Operational Prediction & Post-Processing
 ```bash
 # 1. Full-scene sliding-window inference with 2D Hann blending and 4-fold TTA
 python predict_fullscene.py \
     --model models/segmentation/best_model.pth \
-    --input data/raw/wayanad_stacked_scene.tif \
+    --input data/processed/scenes/wayanad_2024_stack.tif \
     --output output/wayanad_prob.tif \
     --patch-size 512 \
     --stride 256
@@ -201,6 +292,15 @@ python geocode.py \
 ```bash
 # Visualize single-patch input, prediction, and ground truth
 python visualize.py --type patch --image data/processed/l4s/test/image_00001.npy --output figures/patch_001.png
+
+# Single-chip inference with an RGB composite chosen by band name
+python predict.py \
+    --model models/segmentation/best_model.pth \
+    --input data/processed/s1_landsat/test/test_image_00000.npy \
+    --mask data/processed/s1_landsat/test/test_mask_00000.npy \
+    --composite-from-checkpoint \
+    --composite false_color \
+    --output output/predictions
 
 # Plot training and validation loss/IoU curves
 python visualize.py --type training --history models/segmentation/training_history.json --output figures/training_curves.png

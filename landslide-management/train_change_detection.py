@@ -232,9 +232,13 @@ def main():
         help="Change detection architecture (default: snunet)"
     )
     parser.add_argument(
-        "--in-channels", type=int, default=5,
-        help="Channels per temporal image: 5=SAR (VV,VH,VV-VH,coherence,incidence) "
-             "(default: 5)"
+        "--in-channels", type=int, default=7,
+        help=(
+            "Channels per temporal image. The active pipeline feeds each date "
+            "the full S1 bitemporal stack, so 7 = "
+            "vv_pre, vh_pre, vv_post, vh_post, delta_vv, delta_vh, vh_vv_ratio "
+            "(default: 7). Legacy SAR-only sets use 5."
+        ),
     )
     parser.add_argument(
         "--epochs", type=int, default=50,

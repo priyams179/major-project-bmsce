@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
+import logging
 import os
 import sys
 import time
@@ -36,6 +38,16 @@ from scipy import ndimage
 from scipy.interpolate import RegularGridInterpolator
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("preprocess_sar")
+
+# ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 DB_MIN: float = -35.0          # Lower dB clip for landslide-relevant range
@@ -46,6 +58,15 @@ NODATA_VALUE: float = float("nan")
 
 # Sentinel-1 GRD pixel spacing (IW mode, full-res GRD)
 PIXEL_SIZE_M: float = 10.0
+
+#: Canonical 7-channel Sentinel-1 bitemporal stack order.  SAR leads the
+#: multi-modal stack because it is the only all-weather, flood-proof source.
+SAR_CHANNELS = [
+    "vv_pre", "vh_pre",
+    "vv_post", "vh_post",
+    "delta_vv", "delta_vh",
+    "vh_vv_ratio",
+]
 
 COMPRESS_OPTS: Dict = dict(
     compress="deflate",
@@ -879,16 +900,221 @@ def preprocess_scene(
 # 12. Bitemporal pair pipeline
 # ===========================================================================
 
+def _phase_correlate_2d(
+    a: np.ndarray,
+    b: np.ndarray,
+) -> Tuple[int, int]:
+    """
+    Whiten the cross-power spectrum of two 2-D arrays and return the peak
+    displacement as integer (dy, dx).
+
+    Sign convention: ``a`` is the reference and ``b`` the target.  The returned
+    tuple is the shift that **must be applied to the reference** to bring it
+    onto the target.  To align target onto reference instead, apply the
+    negation.
+
+    Implemented locally rather than via ``skimage.registration`` to avoid
+    adding a SciKit-Image dependency for a single FFT.
+
+    Parameters
+    ----------
+    a : np.ndarray (H, W) float64
+        Reference image.
+    b : np.ndarray (H, W) float64
+        Target image.
+
+    Returns
+    -------
+    (dy, dx) : tuple of int
+        Shift to apply to *a* so it matches *b*.
+    """
+    # Remove the mean so DC energy does not dominate the phase.
+    a = a - a.mean()
+    b = b - b.mean()
+
+    fa = np.fft.fft2(a)
+    fb = np.fft.fft2(b)
+
+    cross_power = fa * np.conj(fb)
+
+    magnitude = np.abs(cross_power)
+    # Whiten: divide by |P|, guarding against zero-magnitude bins (where any
+    # phase is meaningless and the result would be numerical noise).
+    mask = magnitude > 1e-12
+    cross_power[mask] /= magnitude[mask]
+    cross_power[~mask] = 0.0 + 0.0j
+
+    correlation = np.fft.ifft2(cross_power).real
+
+    # fftshift centres the zero-displacement peak at (H//2, W//2).
+    shifted = np.fft.fftshift(correlation)
+
+    iy, ix = np.unravel_index(int(np.argmax(shifted)), shifted.shape)
+    dy = iy - shifted.shape[0] // 2
+    dx = ix - shifted.shape[1] // 2
+
+    return int(dy), int(dx)
+
+
+def estimate_integer_shift(
+    reference: np.ndarray,
+    target: np.ndarray,
+    max_shift: int = 64,
+    num_patches: int = 400,
+    patch_size: int = 128,
+    random_seed: int = 42,
+) -> Tuple[int, int]:
+    """
+    Estimate the integer (dy, dx) pixel shift that best aligns *target* onto
+    *reference* via phase correlation on the log-power (dB) images.
+
+    GRD products from the same relative orbit share a look geometry but are
+    NOT guaranteed to be coregistered -- there is often a several-pixel
+    offset from terrain-dependent processing differences.  Differencing an
+    unregistered pair produces spurious edge ringing that looks exactly like
+    a landslide signature, so this must be run before computing change features.
+
+    Parameters
+    ----------
+    reference : np.ndarray (H, W) float32
+        Pre-event dB image, used as the alignment target.
+    target : np.ndarray (H, W) float32
+        Post-event dB image to be aligned onto *reference*.
+    max_shift : int
+        Upper bound on the estimated shift in pixels.
+    num_patches : int
+        Number of random sub-windows to aggregate phase correlation over.
+        A single window is dominated by speckle; averaging many windows gives a
+        robust consensus shift.
+    patch_size : int
+        Side of each sub-window in pixels.
+    random_seed : int
+
+    Returns
+    -------
+    (dy, dx) : tuple of int
+        Shift to apply to *target* (or 0, 0 if estimation failed).
+    """
+    rng = np.random.default_rng(random_seed)
+
+    if reference.shape != target.shape:
+        raise ValueError(
+            f"reference {reference.shape} and target {target.shape} must share "
+            f"a shape to be phase-correlated."
+        )
+
+    H, W = reference.shape
+    if H < patch_size * 2 or W < patch_size * 2:
+        log.warning(
+            "Scene too small (%dx%d) for reliable phase correlation; "
+            "assuming coregistration.", H, W
+        )
+        return (0, 0)
+
+    accum_y = np.zeros((2 * max_shift + 1, 2 * max_shift + 1), dtype=np.float64)
+    n_used = 0
+
+    for _ in range(num_patches):
+        y0 = int(rng.integers(0, H - patch_size))
+        x0 = int(rng.integers(0, W - patch_size))
+
+        ref_win  = reference[y0:y0 + patch_size, x0:x0 + patch_size].astype(np.float64)
+        cand_win = target[y0:y0 + patch_size, x0:x0 + patch_size].astype(np.float64)
+
+        # Skip near-constant windows (water, nodata, solid shadow).
+        if ref_win.std() < 1e-3 or cand_win.std() < 1e-3:
+            continue
+
+        # Pass the candidate first: the helper returns the shift needed on its
+        # first argument, which is what we must apply to *target*.
+        dy, dx = _phase_correlate_2d(cand_win, ref_win)
+
+        # Clamp to the allowed search window.
+        if abs(dy) > max_shift or abs(dx) > max_shift:
+            continue
+
+        accum_y[dy + max_shift, dx + max_shift] += 1.0
+        n_used += 1
+
+    if n_used < max(8, num_patches // 20):
+        log.warning(
+            "Phase correlation usable on only %d/%d windows; "
+            "assuming coregistration.", n_used, num_patches
+        )
+        return (0, 0)
+
+    idx = int(np.argmax(accum_y))
+    dy, dx = idx // accum_y.shape[1] - max_shift, idx % accum_y.shape[1] - max_shift
+
+    # Confidence: fraction of windows voting for the winning shift.
+    confidence = float(accum_y.max() / n_used)
+    log.info(
+        "Estimated co-registration shift dy=%+d dx=%+d "
+        "(confidence %.2f over %d windows)",
+        dy, dx, confidence, n_used,
+    )
+
+    if confidence < 0.15:
+        log.warning(
+            "Low phase-correlation confidence (%.2f); shift likely unreliable. "
+            "Verify the pair visually or run SNAP Apply-Orbit-File.",
+            confidence,
+        )
+    return (dy, dx)
+
+
+def co_register_pair(
+    pre_db: np.ndarray,
+    post_db: np.ndarray,
+    max_shift: int = 64,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Align a pre/post GRD dB pair using an estimated integer shift.
+
+    Sub-pixel resampling is deliberately skipped: near-nadir IW over steep
+    terrain, bilinear interpolation of speckle measurably degrades the change
+    signal.  Integer alignment plus the Refined Lee filter is adequate for
+    landslide-scale change detection.
+
+    Parameters
+    ----------
+    pre_db, post_db : np.ndarray (H, W) float32
+        Calibrated sigma0 in dB for the pre- and post-event scenes.
+    max_shift : int
+
+    Returns
+    -------
+    (pre_aligned, post_aligned, shift) : 3-tuple
+        Shift is ``(dy, dx)`` as returned by :func:`estimate_integer_shift`.
+    """
+    try:
+        dy, dx = estimate_integer_shift(pre_db, post_db, max_shift=max_shift)
+    except ValueError as exc:
+        log.warning("Co-registration skipped: %s", exc)
+        return pre_db, post_db, (0, 0)
+
+    if dy == 0 and dx == 0:
+        return pre_db, post_db, (0, 0)
+
+    # Shift the POST image only.  Moving both by the same offset would leave
+    # their relative misalignment untouched.
+    post_shifted = _shift_array(post_db, dy, dx)
+    return pre_db, post_shifted, (dy, dx)
+
+
 def preprocess_bitemporal_pair(
     pre_safe_dir: str,
     post_safe_dir: str,
     output_dir: str,
     apply_speckle_filter: bool = True,
+    coregister: bool = True,
+    max_shift: int = 64,
 ) -> dict:
     """
     Process a pre/post Sentinel-1 GRD pair and compute change features.
 
-    Runs ``preprocess_scene`` on each image independently, then computes:
+    Runs ``preprocess_scene`` on each image independently, co-registers the
+    pair, then computes:
       - Temporal difference (dB change) for VV and VH
       - Cross-polarization ratio on the post-event image
 
@@ -903,6 +1129,11 @@ def preprocess_bitemporal_pair(
         automatically: ``{output_dir}/pre/`` and ``{output_dir}/post/``.
     apply_speckle_filter : bool
         Apply the Refined Lee filter to both scenes (default True).
+    coregister : bool
+        Estimate and correct the inter-scene pixel shift before differencing.
+        Skipping this produces edge ringing that mimics landslide scars.
+    max_shift : int
+        Maximum co-registration shift searched, in pixels.
 
     Returns
     -------
@@ -914,7 +1145,9 @@ def preprocess_bitemporal_pair(
             "vh_post"     : …,
             "delta_vv"    : …,   # temporal difference VV [0,1]
             "delta_vh"    : …,   # temporal difference VH [0,1]
-            "cross_ratio" : …,   # VH/VV on post image [0,1]
+            "vh_vv_ratio" : …,   # VH/VV on post image [0,1]
+            "shift_dy"    : int,
+            "shift_dx"    : int,
         }``
     """
     pre_dir = os.path.join(output_dir, "pre")
@@ -944,12 +1177,32 @@ def preprocess_bitemporal_pair(
     with rasterio.open(post_paths["vh_db"]) as ds:
         vh_post = ds.read(1)
 
-    # Sanity-check shapes (images must be co-registered or same footprint)
-    if vv_pre.shape != vv_post.shape:
+    # Sanity-check shapes before doing anything with the arrays
+    if vv_pre.shape != vv_post.shape or vh_pre.shape != vh_post.shape:
         raise ValueError(
             f"Pre ({vv_pre.shape}) and post ({vv_post.shape}) scenes have "
-            "different shapes.  Co-register the images before computing change."
+            f"different shapes.  Co-register and clip to a common footprint "
+            f"before computing change."
         )
+
+    # ---- Co-registration -------------------------------------------------
+    shift_dy, shift_dx = 0, 0
+    if coregister:
+        # Estimate once on VV.  VV and VH are geometrically identical within
+        # a GRD scene, so the same offset applies to both; estimating
+        # separately would let speckle give two different answers.
+        print("\nEstimating co-registration shift …")
+        vv_pre, vv_post, (shift_dy, shift_dx) = co_register_pair(
+            vv_pre, vv_post, max_shift=max_shift
+        )
+        if shift_dy or shift_dx:
+            vh_post = _shift_array(vh_post, shift_dy, shift_dx)
+        print(f"  Applied shift: dy={shift_dy:+d}  dx={shift_dx:+d}")
+    else:
+        print("  Co-registration disabled (--no-coregister).")
+
+    print(f"\n{'='*60}")
+    print("Computing temporal change features …")
 
     delta_vv = compute_temporal_difference(vv_pre, vv_post)
     delta_vh = compute_temporal_difference(vh_pre, vh_post)
@@ -966,6 +1219,40 @@ def preprocess_bitemporal_pair(
     print(f"  Saved: {delta_vh_path}")
     print(f"  Saved: {cr_path}")
 
+    # Write the aligned dB pair so downstream stacking sees a co-registered
+    # difference, not the raw uncorrected scenes.
+    _save_band(os.path.join(change_dir, "vv_post_aligned.tif"), vv_post, profile=profile)
+    _save_band(os.path.join(change_dir, "vh_post_aligned.tif"), vh_post, profile=profile)
+
+    # ---- Canonical 7-band stack -----------------------------------------
+    # Individual files above are for inspection; the dataset builder needs one
+    # multi-band file whose band order is fixed by SAR_CHANNELS.  Encoding the
+    # order here means prepare_dataset never has to guess which pre/post file
+    # is which.
+    stack_path = write_sar_stack(
+        vv_pre_db=vv_pre,
+        vh_pre_db=vh_pre,
+        vv_post_db=vv_post,
+        vh_post_db=vh_post,
+        delta_vv=delta_vv,
+        delta_vh=delta_vh,
+        vh_vv_ratio=cross_ratio,
+        profile=profile,
+        output_path=os.path.join(change_dir, "sar_stack.tif"),
+    )
+
+    # Channel manifest: SAR is the primary modality, so it leads the stack.
+    manifest = {
+        "sensor":   "sentinel1",
+        "channels": SAR_CHANNELS,
+        "stack":    stack_path,
+        "shift_dy": shift_dy,
+        "shift_dx": shift_dx,
+    }
+    manifest_path = os.path.join(change_dir, "sar_manifest.json")
+    with open(manifest_path, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+
     return {
         "vv_pre": pre_paths["vv_norm"],
         "vh_pre": pre_paths["vh_norm"],
@@ -973,8 +1260,94 @@ def preprocess_bitemporal_pair(
         "vh_post": post_paths["vh_norm"],
         "delta_vv": delta_vv_path,
         "delta_vh": delta_vh_path,
+        "vh_vv_ratio": cr_path,
         "cross_ratio": cr_path,
+        "vv_post_aligned": os.path.join(change_dir, "vv_post_aligned.tif"),
+        "vh_post_aligned": os.path.join(change_dir, "vh_post_aligned.tif"),
+        "stack": stack_path,
+        "manifest": manifest_path,
+        "shift_dy": shift_dy,
+        "shift_dx": shift_dx,
     }
+
+
+def write_sar_stack(
+    vv_pre_db: np.ndarray,
+    vh_pre_db: np.ndarray,
+    vv_post_db: np.ndarray,
+    vh_post_db: np.ndarray,
+    delta_vv: np.ndarray,
+    delta_vh: np.ndarray,
+    vh_vv_ratio: np.ndarray,
+    profile: dict,
+    output_path: str,
+) -> str:
+    """
+    Write the canonical 7-band Sentinel-1 bitemporal stack.
+
+    Band order is :data:`SAR_CHANNELS`:
+    ``vv_pre, vh_pre, vv_post, vh_post, delta_vv, delta_vh, vh_vv_ratio``.
+
+    The four absolute backscatter bands stay in calibrated dB, clipped to the
+    physically meaningful window defined by ``DB_MIN``/``DB_MAX``.  The two
+    change bands and the ratio are already scaled to [0, 1].  Mixing the two
+    ranges in one file without stating which is which would leave the caller
+    guessing at normalisation, so the manifest records the ranges too.
+
+    Parameters
+    ----------
+    vv_pre_db, vh_pre_db, vv_post_db, vh_post_db : np.ndarray
+        Calibrated dB images, already co-registered.
+    delta_vv, delta_vh : np.ndarray
+        Temporal differences scaled to [0, 1].
+    vh_vv_ratio : np.ndarray
+        VH/VV ratio of the post-event scene, in [0, 1].
+    profile : dict
+        Rasterio profile of the reference grid.
+    output_path : str
+
+    Returns
+    -------
+    str
+        Path of the written stack.
+    """
+    if not (DB_MIN < DB_MAX):
+        raise ValueError(f"Invalid dB window: DB_MIN={DB_MIN} >= DB_MAX={DB_MAX}")
+
+    bands = [
+        np.clip(vv_pre_db,   DB_MIN, DB_MAX),
+        np.clip(vh_pre_db,   DB_MIN, DB_MAX),
+        np.clip(vv_post_db,  DB_MIN, DB_MAX),
+        np.clip(vh_post_db,  DB_MIN, DB_MAX),
+        delta_vv,
+        delta_vh,
+        vh_vv_ratio,
+    ]
+    stack = np.stack([b.astype(np.float32) for b in bands], axis=0)
+    if stack.shape[0] != len(SAR_CHANNELS):
+        raise AssertionError(
+            f"Built {stack.shape[0]} bands but SAR_CHANNELS has "
+            f"{len(SAR_CHANNELS)} entries."
+        )
+
+    out_profile = profile.copy()
+    out_profile.update(
+        count=stack.shape[0],
+        dtype="float32",
+        nodata=NODATA_VALUE,
+        compress="deflate",
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with rasterio.open(output_path, "w", **out_profile) as dst:
+        dst.write(stack)
+        for band, name in enumerate(SAR_CHANNELS, start=1):
+            dst.set_band_description(band, name)
+
+    print(f"  Saved SAR stack ({stack.shape[0]} bands): {output_path}")
+    return output_path
 
 
 # ===========================================================================
@@ -1040,6 +1413,21 @@ def main() -> None:
             "(default: same as --output)."
         ),
     )
+    parser.add_argument(
+        "--no-coregister",
+        action="store_true",
+        help=(
+            "Skip inter-scene phase-correlation alignment.  Only use if the "
+            "pair is already coregistered (e.g. via SNAP)."
+        ),
+    )
+    parser.add_argument(
+        "--max-shift",
+        type=int,
+        default=64,
+        metavar="PX",
+        help="Maximum co-registration shift searched, in pixels (default: 64).",
+    )
 
     args = parser.parse_args()
 
@@ -1056,7 +1444,12 @@ def main() -> None:
         pre_safe = _resolve_safe(args.pre, extract_dir)
         post_safe = _resolve_safe(args.post, extract_dir)
         result = preprocess_bitemporal_pair(
-            pre_safe, post_safe, args.output, apply_filter
+            pre_safe,
+            post_safe,
+            args.output,
+            apply_filter,
+            coregister=not args.no_coregister,
+            max_shift=args.max_shift,
         )
 
     print(f"\n{'='*60}")

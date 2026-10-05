@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Direct Multi-Threaded Landslide4Sense Downloader from Hugging Face
+Direct Multi-Threaded Landslide4Sense Downloader from Hugging Face  --  LEGACY
+
+Not part of the active pipeline.  Kept for reproducing published baselines; see
+download_l4s.py for why the Sentinel-2 benchmark is no longer the default.
 
 Fetches benchmark patches from `ibm-nasa-geospatial/Landslide4sense`,
 extracts the 14-band images and binary landslide masks, and saves them
@@ -13,6 +16,7 @@ import concurrent.futures
 import io
 import json
 import os
+import re
 import sys
 import urllib.request
 import h5py
@@ -20,9 +24,39 @@ import numpy as np
 from tqdm import tqdm
 
 BASE_HF_URL = "https://huggingface.co/datasets/ibm-nasa-geospatial/Landslide4sense/resolve/main"
+BASE_HF_API = "https://huggingface.co/api/datasets/ibm-nasa-geospatial/Landslide4sense/tree/main"
+
+
+def _hf_tree(path: str) -> list:
+    """
+    List files under *path* in the HF repo, following cursor pagination.
+
+    The tree API returns at most 1000 entries per page; the train split has
+    3,799, so a single request would silently truncate the dataset.
+    """
+    url = f"{BASE_HF_API}/{path}"
+    files = []
+    while url:
+        req = urllib.request.Request(url, headers={"User-Agent": "LandslideAI/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            files.extend(json.loads(resp.read()))
+            link = resp.headers.get("Link", "")
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = m.group(1) if m else None
+    return files
+
 
 def download_patch(split: str, idx: int, out_dir: str) -> bool:
     """Download single image and mask, convert and save as .npy."""
+    out_img = os.path.join(out_dir, f"image_{idx:05d}.npy")
+    out_mask = os.path.join(out_dir, f"mask_{idx:05d}.npy")
+    out_valid = os.path.join(out_dir, f"valid_{idx:05d}.npy")
+
+    # Already fetched (re-run / resume): skip without hitting the network.
+    if (os.path.exists(out_img) and os.path.getsize(out_img) > 0
+            and os.path.exists(out_mask) and os.path.getsize(out_mask) > 0):
+        return True
+
     img_name = f"image_{idx}.h5"
     mask_name = f"mask_{idx}.h5"
 
@@ -55,10 +89,6 @@ def download_patch(split: str, idx: int, out_dir: str) -> bool:
         mask_arr[mask_arr < 0] = 0.0
 
         # Save as npy
-        out_img = os.path.join(out_dir, f"image_{idx:05d}.npy")
-        out_mask = os.path.join(out_dir, f"mask_{idx:05d}.npy")
-        out_valid = os.path.join(out_dir, f"valid_{idx:05d}.npy")
-
         np.save(out_img, img_arr)
         np.save(out_mask, mask_arr)
         np.save(out_valid, valid_mask)
@@ -69,15 +99,17 @@ def download_patch(split: str, idx: int, out_dir: str) -> bool:
 
 def fetch_split(split: str, count: int, root_dir: str, max_workers: int = 12) -> int:
     """Download and process split."""
-    split_dir = os.path.join(root_dir, split)
+    # HF calls it 'validation'; the trainer reads 'val'.  Write there
+    # directly so files cannot be stranded in an unreferenced validation/
+    # directory when a val/ folder already exists from an earlier run.
+    local_split = "val" if split == "validation" else split
+    split_dir = os.path.join(root_dir, local_split)
     os.makedirs(split_dir, exist_ok=True)
     print(f"\n--- Downloading {count} patches for split '{split}' into {split_dir} ---")
 
-    # Probe available files
-    api_url = f"https://huggingface.co/api/datasets/ibm-nasa-geospatial/Landslide4sense/tree/main/images/{split}"
-    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        files = json.loads(r.read())
+    # Probe available files.  Paginated: train has 3,799 entries and a
+    # single tree-API page returns at most 1,000.
+    files = _hf_tree(f"images/{split}")
 
     # Extract valid indices
     indices = []
