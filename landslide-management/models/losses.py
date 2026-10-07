@@ -349,3 +349,102 @@ class CombinedLoss(nn.Module):
         ft_loss = self.focal_tversky(logits, targets, mask=mask)
         dice_loss = self.dice(logits, targets, mask=mask)
         return self.ft_weight * ft_loss + self.dice_weight * dice_loss
+
+
+# ---------------------------------------------------------------------------
+# 5. Lovasz-hinge losses
+# ---------------------------------------------------------------------------
+def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
+    """Gradient of the Lovasz extension w.r.t. sorted errors (Berman et al.,
+    CVPR 2018).  `gt_sorted` is the ground-truth flags sorted by model error,
+    descending."""
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+class MaskedLovaszHingeLoss(nn.Module):
+    """
+    Lovasz-hinge loss over valid pixels (binary segmentation).
+
+    Directly optimises the Jaccard index (IoU) via its Lovasz extension, so
+    the training objective matches the evaluation metric instead of proxying
+    it through per-pixel losses.  In the Landslide4Sense 2022 winning
+    solutions this loss was worth roughly +2.5 F1 over plain BCE-style
+    training (2nd-place team ablation).
+
+    Parameters
+    ----------
+    per_image : bool – Compute the loss per patch and average (True, the
+        default, matches the reference implementation) or over the whole
+        batch at once.
+    """
+
+    def __init__(self, per_image: bool = True):
+        super().__init__()
+        self.per_image = per_image
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        logits  : Tensor [B, 1, H, W] – raw network outputs.
+        targets : Tensor [B, 1, H, W] – binary ground-truth.
+        mask    : Tensor [B, 1, H, W] or None – float validity mask; pixels
+            where mask == 0 are excluded from the loss.
+        """
+        losses = []
+        for b in range(logits.shape[0]):
+            logit = logits[b].reshape(-1)
+            tgt = (targets[b].reshape(-1) > 0.5).float()
+            if mask is not None:
+                valid = mask[b].reshape(-1) > 0.5
+                logit, tgt = logit[valid], tgt[valid]
+            if tgt.numel() == 0:
+                continue
+            errors = torch.abs(tgt - torch.sigmoid(logit))
+            errors_sorted, perm = torch.sort(errors, descending=True)
+            tgt_sorted = tgt[perm]
+            losses.append(torch.dot(errors_sorted, _lovasz_grad(tgt_sorted)))
+        if not losses:
+            return logits.sum() * 0.0  # graph-connected zero
+        return sum(losses) / len(losses)
+
+
+class MaskedBCELovaszLoss(nn.Module):
+    """
+    50/50 blend of masked BCE and Lovasz-hinge.
+
+    The BCE term supplies dense per-pixel gradients early in training while
+    the Lovasz term aligns the objective with IoU (the combination used by
+    the 2nd-place L4S 2022 team, in their case weighted cross-entropy +
+    Lovasz).
+    """
+
+    def __init__(self, bce_weight: float = 0.5, pos_weight: float | None = None):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.lovasz_weight = 1.0 - bce_weight
+        self.bce = MaskedBCEDiceLoss(bce_weight=1.0, dice_weight=0.0,
+                                     pos_weight=pos_weight)
+        self.lovasz = MaskedLovaszHingeLoss()
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Weighted sum of masked BCE and masked Lovasz-hinge."""
+        return (self.bce_weight * self.bce(logits, targets, mask=mask)
+                + self.lovasz_weight * self.lovasz(logits, targets, mask=mask))

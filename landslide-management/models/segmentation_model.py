@@ -36,6 +36,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import List
+
 
 # ---------------------------------------------------------------------------
 # U-Net Building Blocks
@@ -205,21 +207,30 @@ class DecoderBlock(nn.Module):
 
     Parameters
     ----------
-    in_ch   : int – Channels from the lower-resolution feature map.
-    skip_ch : int – Channels from the encoder skip connection.
-    out_ch  : int – Output channels after DoubleConv.
+    in_ch     : int  – Channels from the lower-resolution feature map.
+    skip_ch   : int  – Channels from the encoder skip connection.
+    out_ch    : int  – Output channels after DoubleConv.
+    dropout   : float – Dropout probability applied after each upsampled
+                  convolution.  0 disables it (the previous behaviour).  The
+                  decoder is the only part of the network trained from scratch,
+                  so it is where an ImageNet-pretrained encoder overfits a
+                  small patch dataset first.
     """
 
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int,
+                 dropout: float = 0.0):
         super().__init__()
         # Halve channels during upsampling (unless already small)
         up_ch = in_ch // 2 if in_ch > 32 else in_ch
-        self.up = nn.Sequential(
+        up_layers: List[nn.Module] = [
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(in_ch, up_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(up_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        if dropout > 0.0:
+            up_layers.append(nn.Dropout2d(dropout))
+        self.up = nn.Sequential(*up_layers)
         self.conv = DoubleConv(up_ch + skip_ch, out_ch)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
@@ -340,7 +351,8 @@ class ResNet34UNet(nn.Module):
     Final up : 2× bilinear upsample + DoubleConv → 1×1 head
     """
 
-    def __init__(self, in_channels: int = 14, pretrained: bool = True):
+    def __init__(self, in_channels: int = 14, pretrained: bool = True,
+                 decoder_dropout: float = 0.0):
         super().__init__()
         self.in_channels = in_channels
 
@@ -395,10 +407,14 @@ class ResNet34UNet(nn.Module):
         self.bottleneck = ASPP(512, 256, atrous_rates=(6, 12, 18))
 
         # Decoder: bilinear upsample + skip connections
-        self.up1 = DecoderBlock(in_ch=256, skip_ch=256, out_ch=256)
-        self.up2 = DecoderBlock(in_ch=256, skip_ch=128, out_ch=128)
-        self.up3 = DecoderBlock(in_ch=128, skip_ch=64,  out_ch=64)
-        self.up4 = DecoderBlock(in_ch=64,  skip_ch=64,  out_ch=32)
+        self.up1 = DecoderBlock(in_ch=256, skip_ch=256, out_ch=256,
+                                dropout=decoder_dropout)
+        self.up2 = DecoderBlock(in_ch=256, skip_ch=128, out_ch=128,
+                                dropout=decoder_dropout)
+        self.up3 = DecoderBlock(in_ch=128, skip_ch=64,  out_ch=64,
+                                dropout=decoder_dropout)
+        self.up4 = DecoderBlock(in_ch=64,  skip_ch=64,  out_ch=32,
+                                dropout=decoder_dropout)
 
         # Final ×2 upsample back to input resolution
         self.final_up = nn.Sequential(
@@ -448,16 +464,21 @@ def get_model(
     in_channels: int = 14,
     pretrained: bool = True,
     base_features: int = 32,
+    decoder_dropout: float = 0.0,
 ) -> nn.Module:
     """
     Instantiate a landslide segmentation model by architecture name.
 
     Parameters
     ----------
-    arch          : str  – Architecture name: 'unet' or 'resnet34_unet'.
-    in_channels   : int  – Input channels (14 for Config A, 6 for Config B).
-    pretrained    : bool – Use ImageNet pretrained weights (ResNet34UNet only).
-    base_features : int  – Base feature count for UNet (ignored for ResNet34UNet).
+    arch            : str  – Architecture name: 'unet' or 'resnet34_unet'.
+    in_channels     : int  – Input channels (14 for Config A, 6 for Config B).
+    pretrained      : bool – Use ImageNet pretrained weights (ResNet34UNet only).
+    base_features   : int  – Base feature count for UNet (ignored for ResNet34UNet).
+    decoder_dropout : float – Dropout in the ResNet34UNet decoder blocks.  Only
+                      the decoder is trained from scratch, so that is where an
+                      ImageNet encoder overfits a small patch dataset; 0 keeps
+                      the previous no-dropout decoder.
 
     Returns
     -------
@@ -470,14 +491,43 @@ def get_model(
     Examples
     --------
     >>> model = get_model('resnet34_unet', in_channels=14, pretrained=True)
+    >>> model = get_model('resnet34_unet', in_channels=14, decoder_dropout=0.2)
     >>> model = get_model('unet', in_channels=6, base_features=32)
     """
     arch_lower = arch.lower()
     if arch_lower == "resnet34_unet":
-        return ResNet34UNet(in_channels=in_channels, pretrained=pretrained)
+        return ResNet34UNet(in_channels=in_channels, pretrained=pretrained,
+                            decoder_dropout=decoder_dropout)
     elif arch_lower == "unet":
         return UNet(in_channels=in_channels, base_features=base_features)
+    elif arch_lower.startswith("smp_"):
+        # segmentation-models-pytorch architectures, named
+        # "smp_<decoder>_<encoder>".  ImageNet-pretrained encoders are adapted
+        # to in_channels by smp itself (first-conv weight expansion), which is
+        # what lets 14-band input keep pretrained low-level filters.
+        import segmentation_models_pytorch as smp
+
+        _SMP = {
+            "smp_unet_effb4":          ("unet", "efficientnet-b4"),
+            "smp_unet_mitb2":          ("unet", "mit_b2"),
+            "smp_deeplabv3plus_effb4": ("deeplabv3plus", "efficientnet-b4"),
+            "smp_unet_resnet50":       ("unet", "resnet50"),
+        }
+        if arch_lower not in _SMP:
+            raise ValueError(
+                f"Unknown smp architecture '{arch}'. Supported: {sorted(_SMP)}"
+            )
+        decoder, encoder = _SMP[arch_lower]
+        return smp.create_model(
+            arch=decoder,
+            encoder_name=encoder,
+            encoder_weights="imagenet" if pretrained else None,
+            in_channels=in_channels,
+            classes=1,
+        )
     else:
         raise ValueError(
-            f"Unknown architecture '{arch}'. Supported: ['unet', 'resnet34_unet']"
+            f"Unknown architecture '{arch}'. Supported: ['unet', 'resnet34_unet', "
+            f"'smp_unet_effb4', 'smp_unet_mitb2', 'smp_deeplabv3plus_effb4', "
+            f"'smp_unet_resnet50']"
         )

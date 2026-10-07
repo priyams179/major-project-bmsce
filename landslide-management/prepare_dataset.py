@@ -90,7 +90,13 @@ DEFAULT_TEST_REGIONS  = {"nilgiris", "eastern_ghats"}
 #: slope); it is retained for backwards compatibility but is no longer part
 #: of the active training pipeline, which uses Sentinel-1 + Landsat-8/9.
 L4S_PATCH_SIZE = 128
-L4S_CHANNELS   = 14
+# Verified L4S layout (HF + empirical): B01..B12, slope, DEM
+L4S_CHANNELS = 14
+L4S_CHANNEL_NAMES: List[str] = [
+    "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B10", "B11", "B12",
+    "slope",
+    "DEM",
+]
 
 # Minimum fraction of a patch that must be covered by valid (non-cloud) pixels
 MIN_VALID_COVERAGE = 0.10
@@ -347,9 +353,9 @@ def load_l4s_patch(h5_or_tif_path: str | Path) -> Tuple[np.ndarray, np.ndarray]:
     Load a single Landslide4Sense (L4S) patch.
 
     The L4S dataset provides 128×128 patches with 14 channels:
-      ch 0-11  – Sentinel-2 BOA reflectance bands B01…B12 (excluding B10)
-      ch 12    – ALOS PALSAR DEM elevation (m)
-      ch 13    – Slope (degrees)
+      ch 0-11  – Sentinel-2 BOA reflectance bands B01–B12 (B10 included)
+      ch 12    – Slope (degrees)
+      ch 13    – DEM elevation (m)
 
     Mask pixel values:
       0   – No landslide (background)

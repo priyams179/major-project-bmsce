@@ -14,6 +14,8 @@ Loss functions
     MaskedBCEDiceLoss       – combined BCE + Dice loss.
     MaskedDiceLoss          – soft Dice over valid pixels.
     CombinedLoss            – configurable FocalTversky + Dice blend.
+    MaskedLovaszHingeLoss   – IoU-surrogate Lovasz-hinge over valid pixels.
+    MaskedBCELovaszLoss     – 50/50 BCE + Lovasz blend (L4S-2022 2nd place).
 
 Metrics
     ConfusionMatrixTracker  – stateful dataset-level metric accumulator.
@@ -28,6 +30,8 @@ from .losses import (                                                           
     MaskedBCEDiceLoss,
     MaskedDiceLoss,
     CombinedLoss,
+    MaskedLovaszHingeLoss,
+    MaskedBCELovaszLoss,
 )
 from .metrics import (                                                          # noqa: F401
     ConfusionMatrixTracker,
@@ -45,6 +49,8 @@ __all__ = [
     "MaskedBCEDiceLoss",
     "MaskedDiceLoss",
     "CombinedLoss",
+    "MaskedLovaszHingeLoss",
+    "MaskedBCELovaszLoss",
     # Metrics
     "ConfusionMatrixTracker",
     "compute_metrics",

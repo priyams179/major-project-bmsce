@@ -34,8 +34,13 @@ models/**/*.pt
 # ==============================================================================
 # Remote Sensing Datasets & Processed Arrays
 # ==============================================================================
-data/
-dataset/
+!data/
+data/*
+!data/inventory/
+!data/inventory/**
+!data/config/
+!data/config/**
+dataset/*
 *.npy
 *.npz
 *.h5
@@ -73,6 +78,10 @@ predictions/
 # ==============================================================================
 session-*.md
 ses_*.md
+freebuff-*.md
+*-chat-*.md
+*.transcript.md
+.gemini/
 
 # ==============================================================================
 # OS / IDE / Logs / Cache
@@ -84,4 +93,7 @@ Thumbs.db
 *.swp
 *.log
 .crush/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
