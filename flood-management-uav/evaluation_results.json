@@ -1,0 +1,29 @@
+{
+  "segmentor_metrics": {
+    "mIoU": 0.6588,
+    "overall_pixel_accuracy": 0.925,
+    "class_ious": {
+      "Background": 0.892,
+      "Building Flooded": 0.2978,
+      "Building Non-Flooded": 0.7356,
+      "Road Flooded": 0.7152,
+      "Road Non-Flooded": 0.7444,
+      "Water": 0.9124,
+      "Tree": 0.6848,
+      "Vehicle": 0.2882,
+      "Pool": 0.0,
+      "Grass": 0.0
+    },
+    "critical_metrics": {
+      "Water_IoU": 0.9124,
+      "Flooded_Road_IoU": 0.7152,
+      "Flooded_Building_IoU": 0.2978
+    }
+  },
+  "detector_metrics": {
+    "mAP50": 0.4173,
+    "mAP50_95": 0.2401,
+    "precision": 0.6245,
+    "recall": 0.3214
+  }
+}

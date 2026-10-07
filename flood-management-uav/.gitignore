@@ -1,0 +1,52 @@
+# ==============================================================================
+# Python & Virtual Environments
+# ==============================================================================
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ==============================================================================
+# Heavy Model Weights & Training Runs
+# ==============================================================================
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.cache
+
+# ==============================================================================
+# Pipeline Outputs & Scratch Artifacts
+# ==============================================================================
+outputs/
+scratch/
+scratch_*.png
+scratch_*.jpg
+
+# ==============================================================================
+# Raw UAV Datasets (GBs of aerial imagery & YOLO chips)
+# ==============================================================================
+data/floodnet/
+data/fwisd_sample/
+data/real_flood_uav/
+data/real_flood_uav_large/
+data/real_uav_samples/
+data/yolo_detection/
+data/yolo_detection_real/
+data/yolo_detection_large/
+
+# ==============================================================================
+# Force-Track Source Code in models/ and data/
+# (Overrides blanket **/models/ and **/data/ in root repo .gitignore)
+# ==============================================================================
+!models/
+!models/**/*.py
+!models/**/*.md
+!data/
+!data/**/*.py
+!data/**/*.sh
+!data/**/*.md
+
