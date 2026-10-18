@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flood &mdash; Affected Zones &amp; Severity</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div id="map"></div>
+
+  <aside class="panel">
+    <div class="card city-card">
+      <h3>City</h3>
+      <select id="city">
+        {% for c in cities %}
+        <option value="{{ c.key }}" {{ 'selected' if c.key == default_city }}>{{ c.name }}</option>
+        {% endfor %}
+        {% if scenes %}
+        <optgroup label="Detected by the flood model">
+          {% for c in scenes %}
+          <option value="{{ c.key }}" {{ 'selected' if c.key == default_city }}>{{ c.name }}</option>
+          {% endfor %}
+        </optgroup>
+        {% endif %}
+      </select>
+    </div>
+
+    <h1 id="title">Flood &mdash; affected zones</h1>
+    <p class="sub" id="subtitle"></p>
+
+    <div class="card" id="model-card" hidden>
+      <h3>Model detection</h3>
+      <div id="model-info" class="model-info"></div>
+    </div>
+
+    <div class="card" id="stage-card">
+      <h3 id="stage-head">Flood stage</h3>
+      <div class="control">
+        <label><span id="stage-label">Water level</span> <span id="stage-v"></span></label>
+        <input type="range" id="stage_m" min="0.4" max="4.5" step="0.1" value="2.5">
+      </div>
+      <div id="surge-note" class="note"></div>
+    </div>
+
+    <div class="card">
+      <h3>Impact</h3>
+      <div id="stats"></div>
+    </div>
+
+    <div class="card">
+      <h3>Affected zones <span class="muted" id="zone-count"></span></h3>
+      <table>
+        <thead>
+          <tr><th>Tier</th><th>Zone</th><th>Score</th><th>Marks</th>
+              <th>Max&nbsp;cm</th><th>Evac</th></tr>
+        </thead>
+        <tbody id="zone-rows"></tbody>
+      </table>
+      <p id="no-zones" class="note" hidden>No zone meets the clustering threshold yet &mdash; raise the stage.</p>
+    </div>
+
+    <div class="card">
+      <h3>Algorithm parameters</h3>
+      <div class="control">
+        <label>DBSCAN radius <span id="eps_m-v"></span></label>
+        <input type="range" id="eps_m" min="120" max="800" step="10" value="400">
+      </div>
+      <div class="control">
+        <label>Min marks / zone <span id="min_samples-v"></span></label>
+        <input type="range" id="min_samples" min="4" max="25" step="1" value="8">
+      </div>
+      <div class="control">
+        <label>Depth weight vs density <span id="depth_weight-v"></span></label>
+        <input type="range" id="depth_weight" min="0" max="1" step="0.05" value="0.65">
+      </div>
+      <div class="control" id="seed-control">
+        <label>Scenario seed <span id="seed-v"></span></label>
+        <input type="range" id="seed" min="0" max="200" step="1" value="42">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Layers</h3>
+      <div class="toggles">
+        <label><input type="checkbox" id="t-zones" checked> Severity zones</label>
+        <label><input type="checkbox" id="t-routes" checked> Evacuation routes</label>
+        <label><input type="checkbox" id="t-marks" checked> Flood marks</label>
+        <label><input type="checkbox" id="t-noise" checked> Noise marks</label>
+        <label id="t-extent-label" hidden><input type="checkbox" id="t-extent" checked> Model flood extent</label>
+      </div>
+    </div>
+  </aside>
+
+  <div class="legend">
+    <h4>Severity tier</h4>
+    <div class="row"><span class="sw" style="background:#7f0000"></span> Critical</div>
+    <div class="row"><span class="sw" style="background:#d7301f"></span> High</div>
+    <div class="row"><span class="sw" style="background:#fc8d59"></span> Moderate</div>
+    <div class="row"><span class="sw" style="background:#fdcc8a"></span> Low</div>
+    <h4 style="margin-top:8px">Flood depth</h4>
+    <div class="grad"></div>
+    <div class="grad-lab"><span>shallow</span><span>&gt;3&nbsp;m</span></div>
+    <h4 style="margin-top:8px">Routing</h4>
+    <div class="row"><span class="sw route-sw"></span> evacuation route</div>
+    <div class="row"><span class="sw safe-sw"></span> safe high ground</div>
+  </div>
+
+  <script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

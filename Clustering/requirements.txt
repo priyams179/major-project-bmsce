@@ -1,0 +1,8 @@
+numpy>=1.22.0
+pandas>=1.4.0
+scikit-learn>=1.0.0
+scipy>=1.8.0
+flask>=3.0.0
+rasterio>=1.3        # only for `python sar_scenes.py ingest`
+# to run ../flood-management/predict_cnn.py from this venv as well:
+#   torch>=2.0  torchvision>=0.15  matplotlib>=3.7

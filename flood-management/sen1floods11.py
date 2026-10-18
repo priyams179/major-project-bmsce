@@ -186,13 +186,17 @@ def normalize_s1_band(band: np.ndarray) -> np.ndarray:
     """
     Normalize Sentinel-1 SAR array to [0, 1].
     Handles both linear intensity (DN > 0) and backscatter in dB (< 0).
+
+    The two are told apart by sign: linear power is never negative, while dB
+    data always is somewhere (open water sits near -20 dB). Testing for values
+    > 1 instead misreads dB as linear whenever one bright pixel tops 0 dB -
+    67 of the 68 Assam chips in Sen1Floods11 - and log-transforms it a second
+    time, which blanks the band.
     """
-    band = np.nan_to_num(band, nan=DB_MIN)
-    if np.any(band > 1.0):
+    if np.isfinite(band).any() and np.nanmin(band) >= 0.0:
         # Linear power -> convert to dB
-        band_db = 10.0 * np.log10(np.maximum(band, 1e-6))
-    else:
-        band_db = band
+        band = 10.0 * np.log10(np.maximum(band, 1e-6))
+    band_db = np.nan_to_num(band, nan=DB_MIN)
 
     norm = np.clip((band_db - DB_MIN) / (DB_MAX - DB_MIN), 0.0, 1.0)
     return norm.astype(np.float32)

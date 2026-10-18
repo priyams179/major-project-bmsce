@@ -67,7 +67,26 @@ uv run python predict_cnn.py --model models/best_model.pth
 
 # Evaluate on a specific chip ID
 uv run python predict_cnn.py --model models/best_model.pth --chip-id Boliva_103757
+
+# A full Sentinel-1 scene (2-band VV/VH GeoTIFF), optionally cropped to a lon/lat box
+uv run python predict_cnn.py --model best_model.pth --input-s1 scene.tif --bbox 92.6 26.4 93.1 26.8
 ```
+
+Scenes of any size are processed in 2048 px blocks, each predicted in overlapping
+512 px tiles (the training chip size), so memory stays at a few hundred MB.
+Pixels with no radar data are written as 255 (excluded) - they normalise to
+-35 dB, which the model would otherwise call water. `final_model.pth` (bare
+weights) loads as well as `best_model.pth`.
+
+The resulting `*_disaster_map.tif` is the input to `../Clustering/sar_scenes.py
+ingest`, which turns it into priority zones and evacuation routes.
+
+> **Normalisation fix.** `normalize_s1_band` used to treat a band as linear power
+> whenever any pixel exceeded 1, so dB chips with one bright pixel (67 of the 68
+> Assam chips) were log-transformed twice and mostly blanked. It now uses the sign
+> (linear power is never negative). The current weights were trained with the old
+> behaviour, yet score better with the fix (Assam IoU 0.40 -> 0.52); retraining
+> with it should help further.
 
 **Inference outputs**:
 - `predictions/<chip_id>_flood_pred.tif`: Binary GeoTIFF flood map.
