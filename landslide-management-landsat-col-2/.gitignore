@@ -1,0 +1,47 @@
+# --- Python / uv ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- Virtual env (regenerate: uv sync) ---
+.venv/
+
+# --- Raw / heavy data (not committed; re-download or re-export) ---
+data/
+!data/.gitkeep
+
+# --- Trained weights (regenerate: main.py train / l4s) ---
+checkpoints/
+
+# --- Intermediate raster outputs (regenerate from pipeline) ---
+results/masks/
+results/masks_ens/*.tif
+results/masks_ens_relaxed/*.tif
+results/*_prob.tif
+qc/*.png
+
+# --- Keep: small vector/tabular results (committed) ---
+# results/*.geojson, results/*.csv, results/masks_ens/*.json,
+# qc_glc reports
+
+# --- Secrets / auth (NEVER commit) ---
+credentials
+*.credentials
+token.json
+*.pem
+*.key
+.service_account*.json
+
+# --- Logs / downloads ---
+*.log
+nohup.out
+data/L4S/*.zip
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

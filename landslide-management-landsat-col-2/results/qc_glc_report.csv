@@ -1,0 +1,11 @@
+event_id,n_our_polys,glc_lat,glc_lon,glc_title,glc_trigger,dist_to_our_poly_m,dist_to_random_event_m
+hiroshima_jp_2014,6,34.4854,132.44,Asaminami ward,downpour,11080.1,10143386.6
+kedarnath_in_2013,0,30.6945,79.0544,"Rambara District, Uttarakhand",downpour,inf,5654161.1
+kedarnath_in_2013,0,30.7351,79.0666,"Kedarnath (Hindu Shrine), Near Kedarnath Dome (Mountain), Uttarakhand",downpour,inf,5819138.8
+ludian_cn_2014,0,27.0409,103.4086,Longtoushan,earthquake,inf,3474152.3
+minxian_cn_2013,2,34.514,104.149,"Minxian County, Dingxi, Gansu",earthquake,10744.3,10964353.1
+mocoa_co_2017,2,1.151898036,-76.63992276,Deadly Mocoa Landslide,downpour,2954.5,17361845.2
+oso_us_2014,8,48.2847,-121.8495,Oso Mudslide/ Hazel Landslide,downpour,5165.1,13486465.4
+regent_sl_2017,2,8.425227,-13.22917996,Rapid mudslide buries homes,downpour,8257.3,11794140.6
+sindhupalchok_np_2015,0,27.7768,85.8888,Araniko Highway between Barhabise and Tatopani in Sindhupalchok distri,monsoon,inf,7572350.1
+yaan_cn_2013,0,30.3818,102.8154,"Lushan County To Baoxing County (Road), Ya'An, Sichuan",rain,inf,9028605.0
