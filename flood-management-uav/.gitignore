@@ -27,26 +27,19 @@ scratch_*.png
 scratch_*.jpg
 
 # ==============================================================================
-# Raw UAV Datasets (GBs of aerial imagery & YOLO chips)
+# Raw And Processed FloodNet Data
 # ==============================================================================
-data/floodnet/
-data/fwisd_sample/
-data/real_flood_uav/
-data/real_flood_uav_large/
-data/real_uav_samples/
-data/yolo_detection/
-data/yolo_detection_real/
-data/yolo_detection_large/
+data/
 
 # ==============================================================================
-# Force-Track Source Code in models/ and data/
-# (Overrides blanket **/models/ and **/data/ in root repo .gitignore)
+# Tool Caches
 # ==============================================================================
-!models/
-!models/**/*.py
-!models/**/*.md
-!data/
-!data/**/*.py
-!data/**/*.sh
-!data/**/*.md
+.pytest_cache/
+.ruff_cache/
+.streamlit/
+*.log
 
+# ==============================================================================
+# OS Files
+# ==============================================================================
+.DS_Store
