@@ -1,0 +1,22 @@
+segmentation:
+  model:
+    arch: deeplabv3plus
+    encoder: efficientnet-b3
+    encoder_depth: 5
+    decoder_channels: 256
+    num_classes: 10
+    encoder_weights: imagenet
+  train:
+    supervised_epochs: 100
+    semi_supervised_epochs: 100
+    batch_size: 8
+    supervised_lr: 0.001
+    semi_supervised_lr: 0.01
+    alpha_start: 15
+    alpha_end: 655
+    alpha_max: 0.5
+    unlabeled_limit: 547
+    num_workers: 4
+    save_every: 5
+  output_dir: checkpoints
+  checkpoint_name: seg_best.pt

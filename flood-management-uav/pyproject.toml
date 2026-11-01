@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "floodnet"
+version = "0.1.0"
+description = "Semi-supervised classification and segmentation on FloodNet UAV imagery"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [
+  { name = "FloodNet reproduction" },
+]
+dependencies = [
+  "torch>=2.5,<2.8",
+  "torchvision>=0.20,<0.23",
+  "segmentation-models-pytorch>=0.4,<0.6",
+  "albumentations>=2.0,<3",
+  "opencv-python-headless>=4.10",
+  "numpy>=1.26,<3",
+  "pillow>=10.0",
+  "scikit-learn>=1.4",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "tensorboard>=2.16",
+  "matplotlib>=3.8",
+  "huggingface-hub>=0.25",
+  "streamlit>=1.36",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+floodnet = "floodnet.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/floodnet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

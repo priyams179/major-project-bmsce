@@ -1,0 +1,30 @@
+seed: 42
+device: auto
+
+paths:
+  raw_root: data/raw/floodnet
+  processed_root: data/processed
+  checkpoints: checkpoints
+  outputs: outputs
+
+data:
+  num_workers: 4
+  classification:
+    image_size: [300, 400]
+    labeled_split:
+      train_fraction: 0.5
+    include_official_val_test_in_unlabeled: true
+  segmentation:
+    image_size: [512, 512]
+    labeled_test_fraction: 0.3
+    unlabeled_limit: 547
+    val_uses_train_transform: true
+
+legacy:
+  classification_output_inversion: true
+  segmentation_pseudo_logits: true
+  segmentation_pseudo_store_dtype: float32
+
+logging:
+  tensorboard: true
+  csv: true

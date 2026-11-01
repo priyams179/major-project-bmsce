@@ -1,0 +1,17 @@
+classification:
+  model:
+    arch: resnet18
+    num_classes: 2
+    pretrained: true
+  train:
+    epochs: 200
+    batch_size: 64
+    lr: 0.01
+    momentum: 0.0
+    weight_decay: 0.0
+    alpha_start: 10
+    alpha_end: 150
+    alpha_max: 1.0
+    num_workers: 4
+  output_dir: checkpoints
+  checkpoint_name: cls_best.pt

@@ -1,0 +1,34 @@
+seed: 42
+device: cpu
+
+data:
+  num_workers: 0
+  classification:
+    image_size: [300, 400]
+    labeled_split:
+      train_fraction: 0.5
+    include_official_val_test_in_unlabeled: true
+  segmentation:
+    image_size: [128, 128]
+    labeled_test_fraction: 0.3
+    unlabeled_limit: 8
+    val_uses_train_transform: true
+
+classification:
+  train:
+    epochs: 1
+    batch_size: 4
+    num_workers: 0
+
+segmentation:
+  train:
+    supervised_epochs: 1
+    semi_supervised_epochs: 1
+    batch_size: 2
+    num_workers: 0
+    save_every: 0
+  model:
+    encoder_weights: null
+
+logging:
+  tensorboard: false
