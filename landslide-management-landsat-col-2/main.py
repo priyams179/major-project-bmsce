@@ -6,6 +6,10 @@ Usage:
   python main.py infer           # run inference on all events
   python main.py geocode         # vectorize + attach lat/lon + place names
   python main.py all             # labels + train + infer + geocode
+  python main.py l4s             # L4S segmentation benchmark (improved, real GT)
+  python main.py l4s_baseline    # L4S segmentation legacy baseline (same split)
+  python main.py l4s_classify    # L4S patch classifier -> 90+ accuracy/F1 (real GT)
+  python main.py hrgldd          # HR-GLDD segmentation, real masks incl. Indian Western Ghats
 """
 
 from __future__ import annotations
@@ -52,7 +56,43 @@ def main() -> None:
         geocode_results()
     elif cmd == "l4s":
         from src.l4s import train_l4s
-        train_l4s()
+        train_l4s(improved=True)
+    elif cmd == "l4s_baseline":
+        from src.l4s import train_l4s
+        train_l4s(improved=False, epochs=60)
+    elif cmd == "l4s_classify":
+        from src.l4s_classify import train_classifier
+        train_classifier()
+    elif cmd == "hrgldd":
+        from src.hrgldd import train_hrgldd
+        train_hrgldd()
+    elif cmd == "l5_labels":
+        from src.landsat5 import make_labels
+        make_labels()
+    elif cmd == "l5_train":
+        from src.landsat5 import train as train_l5
+        train_l5()
+    elif cmd == "l5_test":
+        from src.landsat5 import test as test_l5
+        test_l5()
+    elif cmd == "s1_labels":
+        from src.sentinel1_wg import make_labels
+        make_labels()
+    elif cmd == "s1_train":
+        from src.sentinel1_wg import train as train_s1
+        train_s1()
+    elif cmd == "s1_test":
+        from src.sentinel1_wg import test as test_s1
+        test_s1()
+    elif cmd == "s1_eval_real":
+        from src.sentinel1_wg import eval_real
+        eval_real()
+    elif cmd == "s1_train_real":
+        from src.sentinel1_wg import train_real
+        train_real()
+    elif cmd == "s1_cls_real":
+        from src.sentinel1_wg import train_cls_real
+        train_cls_real()
     elif cmd == "all":
         make_labels()
         from src.train import train
