@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "earthaccess>=0.19.0",
     "earthengine-api>=1.7.48",
     "geopandas>=1.2.0",
     "h5py>=3.16.0",
