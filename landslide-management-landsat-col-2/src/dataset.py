@@ -80,11 +80,11 @@ class LandslidePairs(Dataset):
     """Patch dataset over all events.
 
     Each item: dict with
-      pre   [6,H,W]  normalized pre (nir,swir1,swir2) + dNBR-like extras
-      post  [6,H,W]  normalized post + extras
-      x     [9,W,W]  model input: pre3 | post3 | (pre-post)3
-      y     [1,H,W]  binary mask
-      valid [1,H,W]  valid-pixel mask
+      x     [3n,H,W]  model input: pre(n) | post(n) | (pre-post)(n)
+                      n = bands kept per scene (v2: 6 refl + slope = 7 -> 21 ch)
+      y     [1,H,W]   binary mask (pseudo-label)
+      valid [1,H,W]   valid-pixel mask
+      event str       event id
     """
 
     def __init__(
