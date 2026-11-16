@@ -37,10 +37,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .model import (
+    BoundaryAwareTverskyLoss,
+    CBAMBlock,
     DeepUNet,
     DiceBCELoss,
     FocalTverskyBCELoss,
     SingleUNet,
+    TwoStreamAttentionUNet,
     metrics,
     tta_logits,
 )
@@ -109,11 +112,32 @@ def compute_norm(pairs: list[tuple[Path, Path]]) -> tuple[np.ndarray, np.ndarray
 
 
 class L4SPatches(Dataset):
-    def __init__(self, pairs, mean, std, augment: bool = False):
+    def __init__(
+        self,
+        pairs,
+        mean,
+        std,
+        augment: bool = False,
+        copy_paste: bool = False,
+        p_copy: float = 0.35,
+    ):
         self.pairs = pairs
         self.mean = mean[:, None, None]
         self.std = std[:, None, None]
         self.augment = augment
+        self.copy_paste = copy_paste
+        self.p_copy = p_copy
+        self.pos_indices = []
+
+        if copy_paste:
+            # Pre-index training patches with confirmed landslide scars (>= 25 px)
+            for i, (_, mp) in enumerate(pairs):
+                try:
+                    with h5py.File(mp, "r") as hf:
+                        if hf["mask"][:].sum() >= 25:
+                            self.pos_indices.append(i)
+                except Exception:
+                    pass
 
     def __len__(self):
         return len(self.pairs)
@@ -124,6 +148,25 @@ class L4SPatches(Dataset):
             img = np.nan_to_num(hf["img"][:].astype(np.float32))  # [H,W,14]
         with h5py.File(mp, "r") as hf:
             mask = hf["mask"][:].astype(np.float32)               # [H,W]
+
+        # Topographic Copy-Paste Augmentation (alleviates ~2.3% rare class imbalance)
+        if self.copy_paste and self.pos_indices and np.random.rand() < self.p_copy:
+            donor_idx = self.pos_indices[np.random.randint(len(self.pos_indices))]
+            d_ip, d_mp = self.pairs[donor_idx]
+            try:
+                with h5py.File(d_ip, "r") as dhf, h5py.File(d_mp, "r") as dmhf:
+                    d_img = np.nan_to_num(dhf["img"][:].astype(np.float32))
+                    d_mask = dmhf["mask"][:].astype(np.float32)
+                scar = d_mask > 0.5
+                if scar.sum() >= 10:
+                    # Enforce topographic realism: paste optical change onto sloping terrain
+                    rcv_slope = img[:, :, 12]  # ALOS slope band
+                    valid_loc = scar & (rcv_slope > 8.0) if (rcv_slope > 8.0).any() else scar
+                    if valid_loc.any():
+                        img[valid_loc, :12] = d_img[valid_loc, :12]  # paste optical channels
+                        mask[valid_loc] = 1.0
+            except Exception:
+                pass
 
         x = img.transpose(2, 0, 1)             # [14,H,W]
         x = (x - self.mean) / self.std
@@ -354,4 +397,159 @@ def train_l4s(
         json.dump({"val_sweep": sweep, "frozen": best_val,
                    "test": test_frozen}, f, indent=2)
     print(f"Artifacts -> {CKPT_DIR}/l4s_report{suffix}.json (+ sweep/val/history)")
+    return report
+
+
+def train_l4s_attention(
+    epochs: int = 40,
+    batch_size: int = 16,
+    lr: float = 3e-4,
+    base: int = 64,
+    num_workers: int = 4,
+    seed: int = 42,
+    warmup: int = 3,
+    copy_paste: bool = True,
+    boundary_weight: float = 0.35,
+) -> dict:
+    """Train + honestly evaluate the Two-Stream Attention U-Net with Topographic
+    Copy-Paste and Boundary-Aware Loss (advanced L4S improvements).
+
+    Features:
+      * Two-Stream Asymmetric Multi-Modal Architecture (Optical vs DEM/Slope)
+      * CBAM Channel & Spatial Attention on multispectral bands
+      * Topographic Gating (Slope & Elevation constrain optical features)
+      * Topographic Copy-Paste Data Augmentation (alleviating 2.3% class imbalance)
+      * Boundary-Aware Tversky Loss (Sobel edge gradient penalizing boundary splatter)
+      * Same strict 3-way split 70/15/15 + D4 Test-Time Augmentation
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CKPT_DIR.mkdir(exist_ok=True)
+    print(f"Device: {device} | mode: two_stream_attention")
+
+    tr_pairs, va_pairs, te_pairs = split_l4s_3way(seed=seed)
+    print(f"L4S split (seed {seed}): {len(tr_pairs)} train / "
+          f"{len(va_pairs)} val / {len(te_pairs)} test (real human GT)")
+
+    mean, std = compute_norm(tr_pairs)
+    with open(NORM_PATH, "w") as f:
+        json.dump({"mean": mean.tolist(), "std": std.tolist(),
+                   "source": "train_split"}, f, indent=2)
+
+    train_ds = L4SPatches(tr_pairs, mean, std, augment=True, copy_paste=copy_paste)
+    val_ds = L4SPatches(va_pairs, mean, std, augment=False)
+    test_ds = L4SPatches(te_pairs, mean, std, augment=False)
+
+    train_dl = DataLoader(train_ds, batch_size, shuffle=True,
+                          num_workers=num_workers, pin_memory=True, drop_last=True)
+    val_dl = DataLoader(val_ds, batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+    test_dl = DataLoader(test_ds, batch_size, shuffle=False,
+                         num_workers=num_workers, pin_memory=True)
+
+    model = TwoStreamAttentionUNet(in_opt=12, in_topo=2, base=base).to(device)
+    criterion = BoundaryAwareTverskyLoss(pos_weight=5.0, alpha=0.3, beta=0.7,
+                                         boundary_weight=boundary_weight).to(device)
+    n_par = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Model: {type(model).__name__} base={base} ({n_par:.1f}M params) | Copy-Paste: {copy_paste}")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    def lr_lambda(ep):
+        if ep < warmup:
+            return (ep + 1) / warmup
+        prog = (ep - warmup) / max(epochs - warmup, 1)
+        return 0.5 * (1 + np.cos(np.pi * prog))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    ckpt = CKPT_DIR / "best_l4s_attention.pt"
+    best = {"f1": -1.0}
+    history = []
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        tr_m = []
+        for batch in train_dl:
+            x = batch["x"].to(device)
+            y = batch["y"].to(device)
+            opt.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            if not torch.isfinite(loss):
+                continue
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_m.append(metrics(logits.detach(), y))
+        sched.step()
+
+        model.eval()
+        va_m = []
+        with torch.no_grad():
+            for batch in val_dl:
+                x = batch["x"].to(device)
+                y = batch["y"].to(device)
+                va_m.append(metrics(model(x), y, thr=0.5))
+        tr_s, va_s = _agg(tr_m), _agg(va_m)
+        dt = time.time() - t0
+        print(f"Epoch {ep:02d}/{epochs} ({dt:.0f}s) lr {opt.param_groups[0]['lr']:.1e} "
+              f"| train F1 {tr_s['f1']:.3f} | val F1 {va_s['f1']:.3f} "
+              f"P {va_s['precision']:.3f} R {va_s['recall']:.3f} IoU {va_s['iou']:.3f}")
+        history.append({"epoch": ep, "train": tr_s, "val": va_s})
+
+        if va_s["f1"] > best["f1"]:
+            best = dict(va_s, epoch=ep)
+            torch.save({"model": model.state_dict(), "epoch": ep,
+                        "f1": va_s["f1"], "base": base, "in_ch": 14,
+                        "arch": type(model).__name__, "improved": True,
+                        "mean": mean.tolist(), "std": std.tolist(),
+                        "dataset": "landslide4sense_attention"}, ckpt)
+            print(f"  -> saved best (val F1 {va_s['f1']:.3f}, epoch {ep})")
+
+    # Final honest evaluation with best checkpoint
+    state = torch.load(ckpt, map_location=device, weights_only=False)
+    model.load_state_dict(state["model"])
+    use_tta = True
+
+    # 1) Freeze threshold on VAL
+    Pv, Gv = _collect_probs(model, val_dl, device, use_tta)
+    sweep = [_f1_at(Pv, Gv, t) for t in np.arange(0.20, 0.81, 0.05)]
+    best_val = max(sweep, key=lambda s: s["f1"])
+    frozen_thr = best_val["thr"]
+
+    # 2) Evaluate on HELD-OUT TEST
+    Pt, Gt = _collect_probs(model, test_dl, device, use_tta)
+    test_050 = _f1_at(Pt, Gt, 0.5)
+    test_frozen = _f1_at(Pt, Gt, frozen_thr)
+
+    print("\n=== VAL threshold sweep (used only to freeze the threshold) ===")
+    for s in sweep:
+        mark = "  <== frozen" if s is best_val else ""
+        print(f"  thr {s['thr']:.2f}: F1 {s['f1']:.3f} "
+              f"P {s['precision']:.3f} R {s['recall']:.3f}{mark}")
+    print("\n=== HELD-OUT TEST (real human GT, touched once) ===")
+    print(f"  thr 0.50        : F1 {test_050['f1']:.4f} "
+          f"P {test_050['precision']:.3f} R {test_050['recall']:.3f} "
+          f"IoU {test_050['iou']:.3f} acc {test_050['acc']:.4f}")
+    print(f"  thr {frozen_thr:.2f} (val) : F1 {test_frozen['f1']:.4f} "
+          f"P {test_frozen['precision']:.3f} R {test_frozen['recall']:.3f} "
+          f"IoU {test_frozen['iou']:.3f} acc {test_frozen['acc']:.4f}")
+    print(f"\nHEADLINE (honest) F1 = {test_frozen['f1']:.4f} "
+          f"on {len(te_pairs)} held-out test patches, thr {frozen_thr:.2f} (TTA={use_tta})")
+
+    with open(CKPT_DIR / "history_l4s_attention.json", "w") as f:
+        json.dump(history, f, indent=2)
+    report = {
+        "mode": "two_stream_attention", "tta": use_tta, "seed": seed,
+        "n_train": len(tr_pairs), "n_val": len(va_pairs), "n_test": len(te_pairs),
+        "best_epoch": best["epoch"], "val_best": best_val,
+        "frozen_threshold": frozen_thr,
+        "test_thr050": test_050, "test_frozen": test_frozen,
+        "val_sweep": sweep,
+    }
+    with open(CKPT_DIR / "l4s_attention_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Artifacts -> {CKPT_DIR}/l4s_attention_report.json")
     return report

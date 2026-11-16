@@ -153,6 +153,146 @@ class DeepUNet(nn.Module):
         return self.head(u)
 
 
+class ChannelAttention(nn.Module):
+    """Channel Attention Module (Squeeze-and-Excitation / CBAM channel block).
+    
+    Dynamically weights spectral bands (e.g. boosting SWIR & Red Edge,
+    suppressing atmospheric water vapor / cirrus).
+    """
+
+    def __init__(self, in_channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(in_channels // reduction, 4)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.gmp = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, in_channels, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        avg_out = self.mlp(self.gap(x).view(b, c))
+        max_out = self.mlp(self.gmp(x).view(b, c))
+        weights = self.sigmoid(avg_out + max_out).view(b, c, 1, 1)
+        return x * weights
+
+
+class SpatialAttention(nn.Module):
+    """Spatial Attention Module (CBAM spatial block).
+    
+    Highlights spatial hazard boundaries and steep terrain zones.
+    """
+
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        scale = torch.cat([avg_out, max_out], dim=1)
+        scale = self.sigmoid(self.conv(scale))
+        return x * scale
+
+
+class CBAMBlock(nn.Module):
+    """Convolutional Block Attention Module (Channel + Spatial)."""
+
+    def __init__(self, in_channels: int, reduction: int = 4, kernel_size: int = 7):
+        super().__init__()
+        self.ca = ChannelAttention(in_channels, reduction=reduction)
+        self.sa = SpatialAttention(kernel_size=kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
+
+
+class TwoStreamAttentionUNet(nn.Module):
+    """Two-Stream Multi-Modal Attention U-Net for Sentinel-2 + Topography (L4S).
+
+    Improvements over standard monolithic U-Net:
+    1. Two-Stream Asymmetric Encoder:
+       - Optical branch: Sentinel-2 12 multispectral bands (B1-B12).
+       - Topographic branch: ALOS PALSAR Slope & DEM (2 bands).
+    2. Spectral Attention: Channel Attention (CBAM) dynamically re-weights
+       multispectral bands.
+    3. Topographic Gating: Topographic slope & elevation feature map modulates
+       optical features (F_opt * (1 + tanh(F_topo))), enforcing physical terrain
+       constraints before downsampling.
+    4. 5-level deep decoder with skip connections and bottleneck dropout.
+    """
+
+    def __init__(self, in_opt: int = 12, in_topo: int = 2, base: int = 64, dropout: float = 0.2):
+        super().__init__()
+        b = base
+        # Optical stream
+        self.opt_stem = conv_block(in_opt, b)
+        self.opt_cbam = CBAMBlock(b, reduction=4)
+
+        # Topographic stream
+        self.topo_stem = nn.Sequential(
+            nn.Conv2d(in_topo, b // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(b // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(b // 2, b, 3, padding=1, bias=False),
+            nn.BatchNorm2d(b),
+            nn.ReLU(inplace=True),
+        )
+
+        # Fused multi-modal stages
+        self.e1_fuse = conv_block(b * 2, b)
+        self.e2 = conv_block(b, b * 2)
+        self.e3 = conv_block(b * 2, b * 4)
+        self.e4 = conv_block(b * 4, b * 8)
+        self.e5 = conv_block(b * 8, b * 16)  # bottleneck
+        self.cbam_bottleneck = CBAMBlock(b * 16, reduction=8)
+
+        self.pool = nn.MaxPool2d(2)
+        self.drop = nn.Dropout2d(dropout)
+
+        # Decoder
+        self.up5 = nn.ConvTranspose2d(b * 16, b * 8, 2, stride=2)
+        self.d5 = conv_block(b * 16, b * 8)
+        self.up4 = nn.ConvTranspose2d(b * 8, b * 4, 2, stride=2)
+        self.d4 = conv_block(b * 8, b * 4)
+        self.up3 = nn.ConvTranspose2d(b * 4, b * 2, 2, stride=2)
+        self.d3 = conv_block(b * 4, b * 2)
+        self.up2 = nn.ConvTranspose2d(b * 2, b, 2, stride=2)
+        self.d2 = conv_block(b * 2, b)
+        self.head = nn.Conv2d(b, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 14, H, W] -> optical [B, 12, H, W], topo [B, 2, H, W]
+        x_opt, x_topo = x[:, :12], x[:, 12:]
+
+        # Asymmetric stems
+        f_opt = self.opt_cbam(self.opt_stem(x_opt))
+        f_topo = self.topo_stem(x_topo)
+
+        # Topographic spatial gate: terrain slope modulates optical features
+        f_gated = f_opt * (1.0 + torch.tanh(f_topo))
+        s1 = self.e1_fuse(torch.cat([f_gated, f_topo], dim=1))
+
+        # Downsampling hierarchy
+        s2 = self.e2(self.pool(s1))
+        s3 = self.e3(self.pool(s2))
+        s4 = self.e4(self.pool(s3))
+        s5 = self.drop(self.cbam_bottleneck(self.e5(self.pool(s4))))
+
+        # Decoder with skip connections
+        u = self.d5(torch.cat([self.up5(s5), s4], dim=1))
+        u = self.d4(torch.cat([self.up4(u), s3], dim=1))
+        u = self.d3(torch.cat([self.up3(u), s2], dim=1))
+        u = self.d2(torch.cat([self.up2(u), s1], dim=1))
+        return self.head(u)
+
+
 class PatchClassifier(nn.Module):
     """Tile-level landslide presence classifier (14-ch, 128x128 -> 1 logit).
 
@@ -253,6 +393,61 @@ class FocalTverskyBCELoss(nn.Module):
 
         loss = loss_bce + tversky
         return torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=0.0)
+
+
+class BoundaryAwareTverskyLoss(nn.Module):
+    """Focal-Tversky + Sobel Boundary Edge Loss.
+
+    Explicitly forces the model to learn sharp landslide perimeters and eliminates
+    boundary edge splatter and dilation.
+    """
+
+    def __init__(
+        self,
+        pos_weight: float = 5.0,
+        gamma: float = 2.0,
+        alpha: float = 0.3,
+        beta: float = 0.7,
+        boundary_weight: float = 0.4,
+    ):
+        super().__init__()
+        self.ft = FocalTverskyBCELoss(pos_weight=pos_weight, gamma=gamma, alpha=alpha, beta=beta)
+        self.boundary_weight = boundary_weight
+
+        # Fixed Sobel kernels for horizontal & vertical edge extraction
+        sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def _get_edges(self, x: torch.Tensor) -> torch.Tensor:
+        sx = self.sobel_x.to(device=x.device, dtype=x.dtype)
+        sy = self.sobel_y.to(device=x.device, dtype=x.dtype)
+        gx = F.conv2d(x, sx, padding=1)
+        gy = F.conv2d(x, sy, padding=1)
+        return torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+        base_loss = self.ft(logits, target, valid=valid)
+
+        if self.boundary_weight <= 0:
+            return base_loss
+
+        prob = torch.sigmoid(logits)
+        pred_edges = self._get_edges(prob)
+        target_edges = self._get_edges(target)
+
+        if valid is not None:
+            pred_edges = pred_edges * valid
+            target_edges = target_edges * valid
+
+        # Edge Dice Loss
+        inter = (pred_edges * target_edges).sum(dim=(1, 2, 3))
+        denom = pred_edges.sum(dim=(1, 2, 3)) + target_edges.sum(dim=(1, 2, 3))
+        edge_loss = (1.0 - (2.0 * inter + 1.0) / (denom + 1.0)).mean()
+
+        total = base_loss + self.boundary_weight * edge_loss
+        return torch.nan_to_num(total, nan=0.0, posinf=1e6, neginf=0.0)
 
 
 class DiceBCELoss(nn.Module):

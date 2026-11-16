@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .l4s import CKPT_DIR, L4SPatches, _f1_at, split_l4s_3way
-from .model import DeepUNet, SingleUNet, tta_logits
+from .model import DeepUNet, SingleUNet, TwoStreamAttentionUNet, tta_logits
 
 
 def _load(ckpt_name: str, cls, device):
@@ -54,7 +54,19 @@ def eval_ensemble(seed: int = 42) -> dict:
     m_imp = _load("best_l4s.pt", DeepUNet, device)
     m_base = _load("best_l4s_baseline.pt", SingleUNet, device)
     models_norms = [m_imp, m_base]
-    print(f"Ensemble: DeepUNet + SingleUNet | {len(va_pairs)} val / {len(te_pairs)} test")
+    members = ["DeepUNet", "SingleUNet"]
+
+    attn_ckpt = CKPT_DIR / "best_l4s_attention.pt"
+    if attn_ckpt.exists():
+        st_attn = torch.load(attn_ckpt, map_location=device, weights_only=False)
+        m_attn = TwoStreamAttentionUNet(in_opt=12, in_topo=2, base=st_attn.get("base", 64)).to(device).eval()
+        m_attn.load_state_dict(st_attn["model"])
+        mean_attn = np.array(st_attn["mean"], np.float32)
+        std_attn = np.array(st_attn["std"], np.float32)
+        models_norms.append((m_attn, mean_attn, std_attn))
+        members.append("TwoStreamAttentionUNet")
+
+    print(f"Ensemble: {' + '.join(members)} | {len(va_pairs)} val / {len(te_pairs)} test")
 
     Pv, Gv = _ensemble_probs(models_norms, va_pairs, device)
     sweep = [_f1_at(Pv, Gv, t) for t in np.arange(0.20, 0.81, 0.05)]
@@ -79,7 +91,7 @@ def eval_ensemble(seed: int = 42) -> dict:
           f"IoU {test_frozen['iou']:.3f} acc {test_frozen['acc']:.4f}")
     print(f"\nENSEMBLE HEADLINE F1 = {test_frozen['f1']:.4f} @ thr {thr:.2f}")
 
-    report = {"members": ["DeepUNet", "SingleUNet"], "frozen_threshold": thr,
+    report = {"members": members, "frozen_threshold": thr,
               "val_best": best_val, "test_thr050": test_050,
               "test_frozen": test_frozen, "val_sweep": sweep,
               "n_val": len(va_pairs), "n_test": len(te_pairs)}

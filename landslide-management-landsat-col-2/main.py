@@ -8,6 +8,7 @@ Usage:
   python main.py all             # labels + train + infer + geocode
   python main.py l4s             # L4S segmentation benchmark (improved, real GT)
   python main.py l4s_baseline    # L4S segmentation legacy baseline (same split)
+  python main.py l4s_attention   # L4S Two-Stream Attention U-Net + Copy-Paste + Boundary Loss
   python main.py l4s_classify    # L4S patch classifier -> 90+ accuracy/F1 (real GT)
   python main.py hrgldd          # HR-GLDD segmentation, real masks incl. Indian Western Ghats
   python main.py uk_inventory    # Uttarakhand inventory & matched stable sampling
@@ -65,6 +66,9 @@ def main() -> None:
     elif cmd == "l4s_baseline":
         from src.l4s import train_l4s
         train_l4s(improved=False, epochs=60)
+    elif cmd == "l4s_attention":
+        from src.l4s import train_l4s_attention
+        train_l4s_attention()
     elif cmd == "l4s_classify":
         from src.l4s_classify import train_classifier
         train_classifier()
