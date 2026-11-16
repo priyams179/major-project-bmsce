@@ -48,3 +48,4 @@ Thumbs.db
 
 # --- Foundation-model weights (re-download from HF; see src/prithvi_l4s.py) ---
 models/**/*.pt
+v

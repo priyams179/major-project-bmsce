@@ -10,6 +10,11 @@ Usage:
   python main.py l4s_baseline    # L4S segmentation legacy baseline (same split)
   python main.py l4s_classify    # L4S patch classifier -> 90+ accuracy/F1 (real GT)
   python main.py hrgldd          # HR-GLDD segmentation, real masks incl. Indian Western Ghats
+  python main.py uk_inventory    # Uttarakhand inventory & matched stable sampling
+  python main.py uk_train        # Uttarakhand Random Forest train & 20-draw spatial CV
+  python main.py uk_rainfall     # Uttarakhand GPM IMERG rainfall analysis
+  python main.py uk_map          # Uttarakhand interactive susceptibility map
+  python main.py uk_all          # All Uttarakhand steps end-to-end
 """
 
 from __future__ import annotations
@@ -93,6 +98,21 @@ def main() -> None:
     elif cmd == "s1_cls_real":
         from src.sentinel1_wg import train_cls_real
         train_cls_real()
+    elif cmd == "uk_inventory":
+        from src.uttarakhand import make_inventory
+        make_inventory()
+    elif cmd == "uk_train":
+        from src.uttarakhand import train
+        train()
+    elif cmd == "uk_rainfall":
+        from src.uttarakhand import rainfall
+        rainfall()
+    elif cmd == "uk_map":
+        from src.uttarakhand import interactive_map
+        interactive_map()
+    elif cmd == "uk_all":
+        from src.uttarakhand import run_all
+        run_all()
     elif cmd == "all":
         make_labels()
         from src.train import train

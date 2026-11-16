@@ -43,6 +43,13 @@ for f in trainX trainY valX valY testX testY; do \
 .venv/bin/python main.py s1_train_real    # fine-tune on real masks -> held-out REAL F1 0.55
 .venv/bin/python main.py s1_cls_real      # tile-level classifier -> 92.9% acc / 90.9% bal-acc
 .venv/bin/python s1_tile_overlay.py       # highlight flagged tiles vs truth -> qc/s1_kodagu_tiles.png
+
+# Uttarakhand (Rudraprayag) Landslide Risk Mapping (Random Forest, 20-draw spatial CV)
+.venv/bin/python main.py uk_inventory     # deduplicate candidate landslides, sample matched stable points
+.venv/bin/python main.py uk_train         # 20-draw spatial CV -> best_uttarakhand_rf.pt, metrics, fig4
+.venv/bin/python main.py uk_rainfall      # GPM IMERG monthly rainfall & monsoon climatology -> fig6
+.venv/bin/python main.py uk_map           # interactive Folium map -> results/uttarakhand/interactive_map.html
+.venv/bin/python main.py uk_all           # run all Uttarakhand steps end-to-end
 ```
 
 ## Results at a glance
@@ -54,6 +61,7 @@ for f in trainX trainY valX valY testX testY; do \
 | Sentinel-1 SAR (catalog-proximity, 30 events) | 57% ≤3 km · 4/4 hits ≤2 km — detects Wayanad, Kodagu, Kavalappara, Taliye |
 | **Historical Landsat-5 Indian model** (Himalaya/NE, held-out, catalog-proximity) | **~40–53% ≤3 km · ~56–63% ≤5 km** (±split variance). Western Ghats = 0% (monsoon cloud) → use the SAR / Sentinel-2 models there |
 | **Indian-region segmentation (HR-GLDD, real high-res masks, held-out test)** | **F1 0.748 · IoU 0.60 · pixel acc 0.943** — incl. Kerala/Karnataka Western Ghats (Kodagu) |
+| **Uttarakhand (Rudraprayag) Landslide Susceptibility** (Random Forest, 20-draw spatial CV) | **AUC 0.744 [0.52–0.85] · 87% held-out landslides in High/Very High** (vs 49% stable; chance 40%) · 1,336 mm monsoon rainfall |
 | **Landslide-presence accuracy (patch classifier, held-out test, real labels)** | **90.7% accuracy · 92.2% F1 · 0.967 AUC** |
 | L4S segmentation F1 (held-out test, honest) | 0.760 ensemble / 0.759 baseline / 0.755 improved (Sentinel-2, 10 m) |
 | Protocol | author or 3-way split; threshold frozen on val; test touched once |

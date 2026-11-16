@@ -1,0 +1,20 @@
+{
+  "dataset": "Uttarakhand_Rudraprayag",
+  "method": "Random Forest with Spatial Cross-Validation (20-Draw Ensemble)",
+  "mean_spatial_cv_auc": 0.744,
+  "spatial_cv_auc_95_ci": [
+    0.5155,
+    0.8502
+  ],
+  "coordinates_only_auc": 0.5854,
+  "held_out_landslides_high_very_high_pct": 87.0,
+  "held_out_stable_high_very_high_pct": 49.0,
+  "feature_importances": {
+    "elevation": 0.0,
+    "slope": 0.0,
+    "aspect_sin": 0.0,
+    "aspect_cos": 0.0,
+    "dist_river": 0.0
+  },
+  "inventory_points": 76
+}
