@@ -1,7 +1,7 @@
 # Landslide Detection from Landsat 8/9 — Technical Report
 
 **Project:** `landslide-management-landsat-col-2`
-**Date:** 21 Oct 2026
+**Date:** 21 Oct 2026 (LandSentry module added 21 Nov 2026, §2.8, §3.11, §4.8)
 **Hardware:** NVIDIA RTX A5000 24 GB
 **Stack:** Python 3.12, PyTorch 2.14, rasterio, geopandas, Google Earth Engine
 
@@ -18,6 +18,10 @@ with real human labels:
   Ghats): **F1 0.748 / IoU 0.60** (§4.3a) — *real* pixel masks, 3 m.
 - **Scene-level detection** (L4S): **90.7 % acc / 92.2 % F1** (§4.1).
 - **Pixel segmentation** (L4S 3-model ensemble): **0.762 F1 / 0.615 IoU** (§4.2).
+- **Bitemporal Sentinel-2 change detection, cross-event** (LandSentry, `landsentry/`):
+  - Kodagu test against the real inventory: F1 **0.694 ± 0.008**, a +2.2-point gain over NDVI differencing.
+  - Kodagu → Wayanad zero-shot: F1 **0.894**, against an index-derived reference.
+  - Wayanad → Kodagu does **not** transfer: F1 0.51.
 
 ## 2. Data
 
@@ -33,6 +37,7 @@ This project integrates satellite remote sensing datasets across optical, microw
 | **Landsat-5 India** | Historical Optical (Landsat-5 TM) | Indian Himalaya & Northeast (2007–2012) | 216 GeoTIFFs (108 pairs); 92 scoped (74 train / 18 test) | 30 m | NASA GLC points (catalog proximity validation) | 3 bands input (9 channels fused) | `SiameseUNet` (9 ch) |
 | **Sentinel-1 SAR Western Ghats** | C-band Synthetic Aperture Radar (Sentinel-1 GRD) | Indian Western Ghats (Kerala, Karnataka, Maharashtra, TN) | 60 GeoTIFFs (30 pairs) + 1 large Kodagu mosaic (3613×4354 px) | 10 m | SAR pseudo-labels + Kodagu 2018 real inventory (217 polygons) | 2 backscatter bands + slope (6–7 channels fused) | `SiameseUNet` (6 ch), `PatchClassifier` (7 ch) |
 | **Uttarakhand Rudraprayag Susceptibility** | Multi-Source Conditioning (SRTM, S2, WorldCover, HydroSHEDS) | Rudraprayag District, Garhwal Himalaya, Uttarakhand, India | 299 reviewed candidates; 76 matched points (38/38); 1 full raster (2489×2061 px) | 30 m | High-res satellite visual confirmation + matched background | 6 conditioning factors (elevation, slope, aspect, NDVI, LC, river dist) | `RandomForestClassifier` (20-draw spatial ensemble) |
+| **LandSentry Sentinel-2 bitemporal (Kodagu 2018 + Wayanad 2024)** | Multi-spectral Optical (Sentinel-2 MSI L1C, s2cloudless-masked dry-season medians) | Kodagu (Karnataka) and Wayanad (Kerala), Western Ghats, India | 2 full scenes (4 composites): Kodagu 3594×4258 px, Wayanad 1779×2189 px; random 128×128 crops on the fly | 10 m | Kodagu: 217 real inventory polygons. Wayanad: seeded NDVI-change *reference* mask (not independent) | 4 bands per date (B2, B3, B4, B8), so 8 channels | `SiameseCNN`, `BITransformer`, NDVI-difference baseline |
 | **NASA Global Landslide Catalog (GLC)** | Tabular point database | Global (11,033 events, 2007–2017; 865 in India) | 11,033 points | Point lat/lon | Documented reports & media | Lat, lon, date, trigger, injury/fatality | Independent spatial proximity check (`qc_glc.py`) |
 | **NASA GPM IMERG V07** | Satellite Precipitation Radar/Radiometer | Rudraprayag District, Uttarakhand, India | 333 monthly series (1998–2025; 28 complete monsoons) | ~11 km (0.1°) | Measured precipitation rate (mm/hr & monthly mm) | Monthly rainfall total (mm) | Monsoon rainfall climatology & trigger analysis |
 
@@ -192,6 +197,37 @@ The SAR pipeline constructs a multi-channel tensor combining dual-polarization b
 
 ---
 
+### 2.8 LandSentry Sentinel-2 Bitemporal Dataset (Kodagu 2018 and Wayanad 2024)
+
+This dataset is a fresh, self-contained re-implementation of the
+[LandSentry](https://github.com/GHRUTHI/Landsentry) idea in `landsentry/`.
+It reuses no code from `src/`. It is built for an explicit **cross-event**
+test: train on one Western Ghats disaster, then detect another.
+
+- **Source:** Sentinel-2 MSI **Level-1C** (`COPERNICUS/S2_HARMONIZED`), joined with `COPERNICUS/S2_CLOUD_PROBABILITY`. Pixels are masked when s2cloudless probability is ≥ 40 % or a QA60 cloud/cirrus bit is set. Scenes with more than 70 % cloud are dropped first. L1C is used instead of L2A because L2A coverage over India is incomplete before Dec 2018: Earth Engine returns 14 L2A scenes against 54 L1C scenes over Kodagu for Jan–May 2018. Both events must be processed identically.
+- **Composites:** Each date is a per-pixel median over a **Dec–Mar dry-season window**. The before and after windows are the same months one year apart, so phenology matches and monsoon cloud is avoided.
+
+  | Event | Before | After | S2 scenes (before/after) | Median clear looks/px | Valid coverage |
+  |---|---|---|---|---|---|
+  | Kodagu (16 Aug 2018) | 2017-12-01 → 2018-03-31 | 2018-12-01 → 2019-03-31 | 38 / 45 | 16 / 20 | 100 % |
+  | Wayanad (30 Jul 2024) | 2023-12-01 → 2024-03-31 | 2024-12-01 → 2025-03-31 | 20 / 23 | 16 / 20 | 100 % |
+- **Grid:** Both dates are downloaded directly onto one fixed **UTM 43N 10 m grid**, using `crs_transform` and 1024 px tiles in parallel. The before and after rasters are therefore pixel-aligned by construction. No resampling or co-registration step is needed, and none of the LandSentry ECC step is required.
+- **Bands:** B2 (blue), B3 (green), B4 (red) and B8 (NIR) at native 10 m, for each date, giving **8 input channels**. This is the same band set as the original LandSentry.
+- **Ground truth and labels:**
+  1. *Kodagu: real.* The 217-polygon Achaiah et al. (2024) inventory (CC BY 4.0) is rasterised onto the S2 grid, giving **51,189 px = 5.12 km²** (0.33 % of the scene). An overlay check shows the polygons sit on the bright fresh scars (`data/landsentry/kodagu/qc_labels.png`).
+  2. *Wayanad: reference, not independent.* No public vector outline of the Mundakkai–Chooralmala debris flow exists. The NRSC/Charter impact maps and journal figures are raster or PDF only, and the original LandSentry repo ships only a **point** placemark (`Mundakkai Landslide 2024.kmz`, 76.1348 E, 11.4646 N). We build a **seeded change reference mask** from it in four steps:
+     - Keep pixels where NDVI(before) − NDVI(after) > 0.20 and NDVI(after) < 0.40.
+     - Apply a 1 px morphological opening.
+     - Keep only the connected change region (linked by a 3 px bridge) that passes within 300 m of the placemark.
+     - Fill holes and drop specks below 0.2 ha.
+
+     The result is **7,049 px = 0.70 km²**: a 5.2 km track (measured along its principal axis, in 4 connected pieces) from the crown down through Chooralmala. It matches the visible scar closely (`data/landsentry/wayanad/qc_labels.png`). Because it is *derived from an NDVI-change rule*, Wayanad scores measure agreement with that rule, not independent accuracy (§4.8).
+- **Spatial splits:** A split raster stores 1 = train, 2 = val and 3 = test. No training crop may overlap the val or test regions, even as context.
+  - *Kodagu:* 512 px (5.12 km) blocks are assigned at random (seeded) to match a 65/15/20 % split of landslide pixels. Train has 33,118 positive px, val 7,824 and test 10,247.
+  - *Wayanad:* the single track is cut perpendicular to its principal (flow) axis, with 16 px gaps. The upper track (source and transport zone) is train with 3,720 px. A middle strip is val with 876 px. The lower track (runout and deposition through Chooralmala) is test with 2,025 px. Each part takes the whole background on its side, so the test region holds 1.77 M pixels of mostly negative terrain, and false positives are fully counted.
+
+---
+
 ## 3. Method
 
 To address different operational scales and modalities, five specialized machine learning and deep learning model architectures were implemented.
@@ -206,6 +242,9 @@ To address different operational scales and modalities, five specialized machine
 | **Single U-Net Baseline** | `SingleUNet` | **7.71 M** | Landslide4Sense | 14 ch; $[B, 14, 128, 128]$ | Standard benchmark comparison | Lightweight 4-level U-Net providing an honest, direct baseline comparison against published L4S competition literature. |
 | **Patch Classifier** | `PatchClassifier` | **9.41 M** | Landslide4Sense, Sentinel-1 SAR Kodagu Tiles | 14 ch (L4S), 7 ch (SAR); $[B, C, 128, 128]$ | Scene-level triage & presence detection | Solves the operational early-warning question ("does this 1.28 km tile contain a landslide?") where 90%+ accuracy is achievable without ambiguous pixel-edge penalties. |
 | **Spatial Random Forest Ensemble** | `RandomForestClassifier` | **20 models × 100 trees** | Uttarakhand Rudraprayag conditioning stack | 5 tabular terrain features (elevation, slope, aspect sin/cos, river dist) | Static terrain susceptibility mapping & spatial risk modeling | Non-parametric, resistant to overfitting on small inventories (38 points), models complex non-linear terrain interactions, and enables spatial cross-validation across 20 background draws. |
+| **LandSentry Siamese CNN** | `landsentry.models.SiameseCNN` | **1.93 M** | LandSentry S2 bitemporal (§2.8) | 8 ch (4 per date); $[B, 8, 128, 128]$ | Bitemporal change segmentation, cross-event | Shared-weight 4-scale encoder (32/64/128/256). The dates are fused only through $\lvert f(\text{pre}) - f(\text{post})\rvert$ at each scale (FC-Siam-diff), which makes the model symmetric and change-focused by design. |
+| **LandSentry BIT Transformer** | `landsentry.models.BITransformer` | **0.69 M** | LandSentry S2 bitemporal (§2.8) | 8 ch; $[B, 8, 128, 128]$ | Bitemporal change segmentation, cross-event | Semantic tokens (4 per date) are exchanged through a transformer encoder across dates, then projected back to pixels by cross-attention. Global bitemporal context at low cost; tests whether attention transfers better across events than pure convolution. |
+| **NDVI-difference baseline** | `landsentry.cross_event.baseline_score` | **0** | (threshold only) | NDVI(pre), NDVI(post) | Non-learned reference | A deep model must beat this to justify itself. It also exposes how circular the Wayanad reference mask is. |
 | **Prithvi-100M ViT** *(Tested, rejected)* | Foundation Model ViT | **100 M** | Landslide4Sense fine-tune | 6 optical bands; $[B, 6, 224, 224]$ | Foundation model evaluation | Tested to explore whether NASA-IBM foundation pre-training could transfer; rejected due to coarse 14×14 tokenization losing fine scar edges (F1 0.669 vs 0.755). |
 
 ---
@@ -315,6 +354,32 @@ To assess whether pre-trained geospatial foundation models could supersede domai
 - **Setup:** Mapped L4S bands to Prithvi order $[B2, B3, B4, B8, B11, B12]$, interpolated patches from 128×128 to 224×224 pixels, fine-tuned with AdamW for 30 epochs.
 - **Result:** Test F1 reached **0.669** (IoU 0.502), trailing the scratch-trained `DeepUNet` (F1 **0.755**, IoU 0.606) by **8.6 F1 points**.
 - **Failure Analysis:** ViT tokenization ($14\times 14$ patches) is too coarse for narrow landslide scars; upsampling loses fine edge detail that U-Net skip connections preserve. Additionally, the pre-training resolution (30 m) mismatched the target data (10 m), and ~2,600 training patches were insufficient to adapt a 100M-parameter transformer. Shipped models therefore rely on convolutional U-Nets.
+
+### 3.11 LandSentry: Bitemporal Sentinel-2 Change Detection and Cross-Event Transfer (`landsentry/`)
+
+This is a fresh implementation, separate from `src/`, of the LandSentry
+project (bitemporal Siamese CNN and BIT transformer, Kodagu ↔ Wayanad
+cross-event testing). Its known defects are
+fixed: per-event normalisation, placeholder data, no augmentation, and a
+README that contradicts the shipped results.
+
+- **`SiameseCNN` (1.93 M params):** A shared encoder of 4 stages, each a double 3×3 conv + BatchNorm + ReLU (32, 64, 128 and 256 ch), with 2×2 max-pool between stages. At every scale the skip is $\lvert f_s(\text{pre}) - f_s(\text{post})\rvert$. The decoder uses ConvTranspose upsampling, concatenates the difference skip and applies a double conv. A 1×1 head outputs the logit.
+- **`BITransformer` (0.69 M params)** follows Chen et al., 2021, "Remote Sensing Image Change Detection with Transformers":
+  - A shared residual backbone (stem, then 48 ch at stride 2, then 64 ch at stride 4, each with 2 ResBlocks).
+  - A **semantic tokenizer**: a 1×1 conv produces L = 4 spatial-softmax attention maps per date, and the tokens are $T = A^\top X$.
+  - A 1-layer, 8-head **transformer encoder** over the 2L = 8 bitemporal tokens, with learned positional embeddings.
+  - An 8-layer **cross-attention decoder**: each pixel queries its own date's tokens, with no pixel self-attention.
+  - The difference $\lvert X'_\text{pre} - X'_\text{post}\rvert$ is bilinearly upsampled ×4 and passed through a conv head.
+- **Normalisation (per scene, joint):** Per-band 2nd/98th percentiles are computed over the *union* of the before and after composites of a scene, and applied to both dates. Shared statistics keep real reflectance change intact. Per-scene statistics cancel event-to-event radiometric offsets (haze, sun angle, year). The original repo instead normalised Wayanad with Kodagu statistics.
+- **Training:**
+  - Random 128×128 crops, sampled on the fly from the *train region only*. 50 % are centred near a landslide pixel.
+  - D4 flips and rotations, plus **independent per-date gain/offset jitter** (σ 0.08 / 0.04) to simulate inter-event radiometric shift.
+  - Loss: 0.5 · BCE(pos_weight 5) + 0.5 · soft Dice, restricted to valid pixels.
+  - AdamW (lr 3e-4, wd 1e-4) with OneCycle, bf16 autocast, batch 16, 200 steps per epoch, up to 40 epochs, early stop after 10 epochs with no val gain.
+- **Model and threshold selection** use *only the source event's val region*. Each epoch, the scene is predicted with a sliding window (256 px tiles, 64 px overlap, Hann-window blending). The checkpoint with the best val F1 is kept together with its F1-optimal threshold. That threshold is **frozen** and applied unchanged to every test set, including the other event. The target event is never used for tuning.
+- **Cross-event protocol:** {Siamese, BIT} × train on {Kodagu, Wayanad, both} × 3 seeds = 18 runs. Each is tested on the test region of **both** events. Off-diagonal cells (train on A, test on B) are true zero-shot transfers, and these are also scored on the target's *whole scene*.
+  - Metrics: precision, recall, F1 and IoU at the frozen threshold; **average precision (AP)**, which does not depend on a threshold; and an *oracle* F1 (best threshold on the test set). The oracle F1 is reported only to separate ranking quality from threshold miscalibration; it is not a deployment number.
+  - The non-learned **NDVI-difference baseline**, score = clip(NDVI_pre − NDVI_post, 0, 1), runs under the same threshold protocol.
 
 ---
 
@@ -646,6 +711,70 @@ dedicated panels (`qc/*_in_*.png`).
 → Georeferencing verified correct; model detects real change; ensemble
 conservative (precision-first).
 
+### 4.8 LandSentry: bitemporal S2 change detection and cross-event transfer (Kodagu ↔ Wayanad)
+
+The protocol is described in §3.11. All numbers are pixel metrics on the
+**held-out test region**, given as mean ± std over 3 seeds. The decision
+threshold is frozen on the *training* event's val split, so an off-diagonal
+cell is a true zero-shot transfer. AP is average precision, which does not
+depend on the threshold. Full table: `results/landsentry/cross_event.md`;
+per-run rows: `runs.csv`.
+
+**Kodagu test region: real ground truth (217-polygon inventory, 10,247 positive px)**
+
+| Method | Trained on | F1 | IoU | Precision | Recall | AP |
+|---|---|---|---|---|---|---|
+| NDVI-difference baseline (no learning) | thr tuned on Kodagu | 0.672 | 0.506 | 0.664 | 0.679 | 0.680 |
+| Siamese CNN | Kodagu | 0.686 ± 0.009 | 0.522 ± 0.011 | 0.678 ± 0.013 | 0.695 ± 0.033 | 0.697 ± 0.014 |
+| BIT transformer | Kodagu | 0.683 ± 0.046 | 0.519 ± 0.052 | 0.680 ± 0.075 | 0.687 ± 0.021 | 0.732 ± 0.065 |
+| Siamese CNN | Kodagu + Wayanad | **0.694 ± 0.008** | **0.531 ± 0.009** | 0.682 ± 0.017 | 0.707 ± 0.007 | 0.709 ± 0.022 |
+| BIT transformer | Kodagu + Wayanad | 0.689 ± 0.004 | 0.526 ± 0.005 | 0.701 ± 0.033 | 0.680 ± 0.031 | **0.736 ± 0.013** |
+| Siamese CNN | Wayanad only *(zero-shot)* | 0.514 ± 0.069 | 0.348 ± 0.063 | 0.665 ± 0.041 | 0.428 ± 0.101 | 0.462 ± 0.108 |
+| BIT transformer | Wayanad only *(zero-shot)* | 0.413 ± 0.133 | 0.266 ± 0.112 | 0.600 ± 0.129 | 0.326 ± 0.143 | 0.341 ± 0.159 |
+| NDVI baseline | thr tuned on Wayanad *(zero-shot)* | 0.651 | 0.483 | 0.571 | 0.759 | 0.680 |
+
+**Wayanad test region: seeded NDVI-change reference (2,025 positive px; partly circular, see below)**
+
+| Method | Trained on | F1 | IoU | Precision | Recall | AP |
+|---|---|---|---|---|---|---|
+| NDVI baseline | thr tuned on Kodagu *(zero-shot)* | 0.835 | 0.716 | 0.963 | 0.737 | 0.951 |
+| Siamese CNN | Kodagu *(zero-shot)* | **0.894 ± 0.012** | 0.809 ± 0.019 | 0.904 ± 0.002 | 0.885 ± 0.022 | 0.921 ± 0.016 |
+| BIT transformer | Kodagu *(zero-shot)* | 0.868 ± 0.019 | 0.767 ± 0.029 | 0.944 ± 0.012 | 0.803 ± 0.033 | 0.940 ± 0.021 |
+| Siamese CNN | Wayanad | 0.929 ± 0.004 | 0.867 ± 0.006 | 0.934 ± 0.006 | 0.924 ± 0.012 | 0.944 ± 0.036 |
+| BIT transformer | Wayanad | 0.937 ± 0.008 | 0.882 ± 0.014 | 0.937 ± 0.002 | 0.937 ± 0.018 | 0.979 ± 0.005 |
+| Siamese CNN | Kodagu + Wayanad | 0.914 ± 0.003 | 0.842 ± 0.005 | 0.939 ± 0.014 | 0.891 ± 0.018 | 0.947 ± 0.018 |
+| BIT transformer | Kodagu + Wayanad | 0.903 ± 0.016 | 0.824 ± 0.027 | 0.916 ± 0.014 | 0.891 ± 0.018 | 0.960 ± 0.009 |
+
+**Zero-shot transfer scored on the target's whole scene** (every pixel, no split)
+
+| Method | Train → test | F1 | Precision | Recall | AP |
+|---|---|---|---|---|---|
+| NDVI baseline | Kodagu → Wayanad | **0.774** | 0.831 | 0.725 | **0.871** |
+| Siamese CNN | Kodagu → Wayanad | 0.766 ± 0.042 | 0.801 ± 0.020 | 0.736 ± 0.074 | 0.793 ± 0.048 |
+| BIT transformer | Kodagu → Wayanad | 0.694 ± 0.050 | 0.857 ± 0.121 | 0.604 ± 0.129 | 0.756 ± 0.075 |
+| NDVI baseline | Wayanad → Kodagu | **0.563** | 0.477 | 0.687 | **0.574** |
+| Siamese CNN | Wayanad → Kodagu | 0.454 ± 0.035 | 0.550 ± 0.068 | 0.397 ± 0.079 | 0.384 ± 0.093 |
+| BIT transformer | Wayanad → Kodagu | 0.359 ± 0.074 | 0.382 ± 0.051 | 0.342 ± 0.099 | 0.242 ± 0.082 |
+
+Figures: `results/landsentry/fig_cross_event.png` (2×2 F1/AP heatmaps per
+method), `fig_qualitative.png` (4 km test-region crops showing before,
+after, reference and the four model/source combinations), and
+`fig_training.png` (val curves).
+
+**Findings**
+
+1. **Deep models give only a small gain over a simple index on real ground truth.** On Kodagu, the best learned result is the Siamese CNN trained on both events (F1 **0.694 ± 0.008**). It beats non-learned NDVI differencing (0.672) by **+2.2 F1 points**. The BIT transformer gives the best ranking quality (AP **0.736 ± 0.013** vs 0.680, +5.6 AP), but its F1 is no better because the frozen threshold costs it. At 10 m with only 4 bands, most of the separable signal is vegetation loss, which NDVI already captures. The learned gain is in boundaries and in rejecting some non-landslide bare surfaces.
+2. **Transfer is asymmetric.**
+   - *Kodagu → Wayanad works:* the Siamese CNN gets F1 0.894 ± 0.012 on the Wayanad test track, zero-shot, with a frozen threshold.
+   - *Wayanad → Kodagu fails:* Siamese F1 0.514 ± 0.069 and BIT 0.413 ± 0.133, both below the NDVI baseline's 0.651.
+   - The low and highly variable AP (0.46 ± 0.11 and 0.34 ± 0.16) shows the models mis-rank Kodagu's pixels, not just that the threshold is off. Wayanad provides one debris flow and 3,720 training pixels, and the models memorise it: training loss falls to ~0.001, and the val-tuned threshold of one seed collapsed to 0.003. They then miss Kodagu's narrow, branching channelised slides, which look nothing like a single 100–300 m-wide runout track (`fig_qualitative.png`, top row).
+   - This contradicts the hope that attention transfers better. The BIT transformer generalises **worse** than the CNN in both directions, and is less stable across seeds (±0.046 to ±0.133).
+3. **Wayanad scores are partly circular.** The Wayanad reference mask was produced by an NDVI-change rule (§2.8). The NDVI baseline's Wayanad numbers (AP 0.951) therefore measure agreement with itself, and every Wayanad F1 in the 0.83–0.94 range should be read as "agrees with an index-derived outline of the scar", not as independent accuracy. Two consequences:
+   - On the whole Wayanad scene, NDVI (F1 0.774) still edges out the Kodagu-trained Siamese CNN (0.766 ± 0.042).
+   - The 0.894 test-region F1 is evidence that the model *finds* the Wayanad scar. It is not evidence that it beats a simple index there.
+4. **Comparison with the original LandSentry repo.** The original reports Siamese Dice 0.390 on Kodagu and 0.138 on Wayanad, and transformer Dice 0.375 / 0.086. Our numbers are much higher, but the labels, splits and protocols differ, so they are not directly comparable. The original's Wayanad array files also appear to be placeholders. What this implementation adds: the identical label source for Kodagu, per-scene normalisation (the original normalised Wayanad with Kodagu statistics), a fixed-grid pixel-aligned download, threshold freezing on the source event, seeds, and a baseline.
+5. **Recommended operational model:** `siamese_both_s0.pt`. Training on both events gives the highest and most stable Kodagu F1 (±0.008) and keeps Wayanad above 0.91. It must still be treated as a vegetation-loss detector. Clear-cutting, construction, river-bank erosion and fresh cloud artefacts can trigger it, and §4.8 has no independent test outside these two Western Ghats events.
+
 ## 5. Failure analysis (why catalog recall is weak)
 
 1. **Scene coverage**: exports centred on town coordinates, not slide
@@ -707,6 +836,12 @@ mkdir -p data/HR_GLDD && for f in trainX trainY valX valY testX testY; do \
 .venv/bin/python main.py uk_map           # interactive Folium map -> results/uttarakhand/interactive_map.html
 .venv/bin/python main.py uk_all           # run full Uttarakhand pipeline end-to-end
 
+# --- LandSentry: bitemporal S2 change detection + cross-event (§3.11) ---
+.venv/bin/python -m landsentry prepare       # S2 L1C pre/post composites, UTM 10 m (~6 min)
+.venv/bin/python -m landsentry labels        # Kodagu inventory mask, Wayanad reference mask, splits, QC png
+.venv/bin/python -m landsentry cross-event   # 2 models x 3 sources x 3 seeds + NDVI baseline (~1 h on the A5000)
+.venv/bin/python -m landsentry evaluate --checkpoint checkpoints/landsentry/siamese_kodagu_s0.pt --event wayanad
+
 # --- GEE re-export (auth expires) ---
 # ssh -L 8085:localhost:8085 <host> then:
 .venv/bin/python -c "import ee; ee.Authenticate(auth_mode='localhost')"
@@ -758,6 +893,12 @@ python download_uttarakhand_features.py --project <ee-project> # Rudraprayag fea
 | `qc/*.png`, `qc/*_in_*.png` | PRE/POST/mask visual QC panels (incl. Indian) |
 | `download_landsat5_india.py`, `download_sentinel1_wg.py`, `build_kodagu_gt.py`, `s1_tile_overlay.py` | L5/SAR download, real-GT build, tile overlay |
 | `src/`, `main.py` | full pipeline code |
+| `landsentry/` | **LandSentry** fresh implementation: models, GEE, labels, training, cross-event runner (`landsentry/README.md`) |
+| `data/landsentry/{kodagu,wayanad}/{pre,post,mask,split}.tif` | S2 composites (int16 reflectance ×1e4 + `n_obs`), label masks, split rasters |
+| `data/landsentry/*/qc_labels.png`, `labels.json`, `imagery.json` | label/split QC panel and provenance metadata |
+| `checkpoints/landsentry/{siamese,transformer}_{kodagu,wayanad,both}_s{0,1,2}.pt` | 18 cross-event checkpoints (each stores its frozen val threshold) + `_history.json` |
+| `results/landsentry/cross_event.{md,json}`, `runs.csv` | cross-event tables (mean ± std) and per-run metrics |
+| `results/landsentry/fig_cross_event.png`, `fig_qualitative.png`, `fig_training.png` | 2×2 F1/AP heatmaps, test-region panels, val curves |
 
 ## 8. Conclusions
 
@@ -776,6 +917,11 @@ python download_uttarakhand_features.py --project <ee-project> # Rudraprayag fea
    inference → georeferenced polygons for 39 real events (141 strict /
    237 relaxed polygons, 65–114 km²), **8 of them in Indian regions, 6/8
    detected** with visual-QC confirmation (wayanad on the Chooralmala scar).
+5. **LandSentry (bitemporal Sentinel-2, cross-event), §4.8.** This is a working re-implementation with an honest protocol: Siamese CNN, BIT transformer, NDVI baseline, and a two-event transfer matrix over 3 seeds.
+   - On real Kodagu labels, learned change detectors beat plain NDVI differencing by only about 2 F1 points (0.694 vs 0.672) and about 5 AP points.
+   - Transfer from the rich multi-slide event to the single debris flow works (0.894 F1). The reverse fails (0.41–0.51).
+   - The transformer does not transfer better than the CNN.
+   - Wayanad scores rest on an index-derived reference mask and are not independent accuracy.
 
 ## 9. Recommended next steps
 
@@ -789,3 +935,8 @@ python download_uttarakhand_features.py --project <ee-project> # Rudraprayag fea
   L4S classifier applies directly; re-export miss events (shirur, kedarnath)
   with QA_PIXEL cloud masking.
 - Adaptive pseudo-label thresholds (fix 0%-label events) → retrain.
+- **LandSentry:**
+  - Replace the Wayanad index-derived reference with an independent outline: digitise the NRSC/Charter impact map, or request the vector from the Sci. Rep. 2025 authors. This would make the Wayanad numbers non-circular.
+  - Add more labelled Western Ghats events (e.g. Kavalappara/Puthumala 2019 from HR-GLDD-style inventories) so that "train on one event" stops meaning "memorise one scar".
+  - Add SWIR (B11/B12) and slope channels to move beyond what NDVI differencing already captures.
+  - Add a Sentinel-1 fallback for monsoon-season requests, when optical windows are cloud-bound.
